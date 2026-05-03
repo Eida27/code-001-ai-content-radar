@@ -68,23 +68,41 @@ class SupabaseRestClient:
     def load_items_ready_for_drafting(
         self, limit: int, min_importance_score: int
     ) -> list[NewsItem]:
-        response = self._client.get(
-            "/news_items",
-            params={
-                "select": "*",
-                "status": "eq.scored",
-                "importance_score": f"gte.{min_importance_score}",
-                "order": "created_at.asc",
-                "limit": str(limit),
-            },
-        )
-        response.raise_for_status()
+        if limit <= 0:
+            return []
 
         items: list[NewsItem] = []
-        for row in response.json():
-            if self._item_has_draft(row["id"]):
-                continue
-            items.append(_row_to_news_item(row))
+        page_size = max(limit * 3, 10)
+        offset = 0
+
+        while len(items) < limit:
+            response = self._client.get(
+                "/news_items",
+                params={
+                    "select": "*",
+                    "status": "eq.scored",
+                    "importance_score": f"gte.{min_importance_score}",
+                    "order": "created_at.asc",
+                    "limit": str(page_size),
+                    "offset": str(offset),
+                },
+            )
+            response.raise_for_status()
+            rows = response.json()
+            if not rows:
+                break
+
+            for row in rows:
+                if self._item_has_draft(row["id"]):
+                    continue
+                items.append(_row_to_news_item(row))
+                if len(items) >= limit:
+                    break
+
+            if len(rows) < page_size:
+                break
+            offset += page_size
+
         return items
 
     def _item_has_draft(self, news_item_id: str) -> bool:
