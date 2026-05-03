@@ -274,7 +274,7 @@ class SupabaseRestClient:
         if not news_item_id or not drafts:
             return
         response = self._client.post(
-            "/drafts",
+            "/drafts?on_conflict=news_item_id,draft_type",
             json=[
                 {
                     "news_item_id": news_item_id,
@@ -285,6 +285,7 @@ class SupabaseRestClient:
                 }
                 for draft in drafts
             ],
+            headers={"Prefer": "resolution=ignore-duplicates,return=minimal"},
         )
         response.raise_for_status()
 

@@ -1,3 +1,4 @@
+from worker.models import Draft
 from worker.services.supabase_client import SupabaseRestClient
 
 
@@ -35,6 +36,15 @@ class FakeRestClient:
         raise AssertionError(f"Unexpected path {path}")
 
 
+class FakeDraftRestClient:
+    def __init__(self):
+        self.calls = []
+
+    def post(self, path, json=None, headers=None):
+        self.calls.append((path, json, headers or {}))
+        return FakeResponse([])
+
+
 def test_load_items_ready_for_drafting_does_not_starve_after_drafted_rows():
     client = SupabaseRestClient("https://example.supabase.co", "service-role", 10)
     client._client.close()
@@ -46,6 +56,34 @@ def test_load_items_ready_for_drafting_does_not_starve_after_drafted_rows():
     assert [item.id for item in items] == ["eligible-1"]
     news_item_calls = [call for call in fake_rest.calls if call[0] == "/news_items"]
     assert int(news_item_calls[0][1]["limit"]) > 1
+
+
+def test_save_drafts_uses_unique_conflict_target_for_idempotency():
+    client = SupabaseRestClient("https://example.supabase.co", "service-role", 10)
+    client._client.close()
+    fake_rest = FakeDraftRestClient()
+    client._client = fake_rest
+
+    client.save_drafts(
+        "news-1",
+        [Draft("short_post", "Draft copy", "model-a")],
+    )
+
+    assert fake_rest.calls == [
+        (
+            "/drafts?on_conflict=news_item_id,draft_type",
+            [
+                {
+                    "news_item_id": "news-1",
+                    "draft_type": "short_post",
+                    "content": "Draft copy",
+                    "model_used": "model-a",
+                    "status": "needs_review",
+                }
+            ],
+            {"Prefer": "resolution=ignore-duplicates,return=minimal"},
+        )
+    ]
 
 
 def _news_item_row(item_id):

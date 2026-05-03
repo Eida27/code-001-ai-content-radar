@@ -10,6 +10,9 @@ RETENTION_DISCORD_MIGRATION = (
     ROOT / "supabase" / "migrations" / "003_retention_discord_digest.sql"
 )
 FRESHNESS_MIGRATION = ROOT / "supabase" / "migrations" / "004_freshness_hardening.sql"
+DRAFT_IDEMPOTENCY_MIGRATION = (
+    ROOT / "supabase" / "migrations" / "005_draft_idempotency.sql"
+)
 
 
 def test_schema_has_strict_statuses_indexes_dedupe_and_rls():
@@ -99,3 +102,11 @@ def test_freshness_hardening_schema_and_sources():
     assert "https://blog.google/innovation-and-ai/technology/ai/rss/" in sql
     assert "https://blogs.nvidia.com/blog/category/deep-learning/feed/" in sql
     assert "https://tensorfeed.ai/feed.xml" in sql
+
+
+def test_draft_idempotency_schema_has_unique_news_item_draft_type_index():
+    sql = DRAFT_IDEMPOTENCY_MIGRATION.read_text(encoding="utf-8").lower()
+
+    assert "drafts_news_item_id_draft_type_unique_idx" in sql
+    assert "create unique index if not exists" in sql
+    assert "on public.drafts (news_item_id, draft_type)" in sql
