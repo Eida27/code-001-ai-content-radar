@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 
-from worker.models import Draft, NewsItem, Source
+from worker.models import DiscordAlert, Draft, NewsItem, Score, Source
 
 
 class DuplicateItemError(RuntimeError):
@@ -210,6 +210,155 @@ class SupabaseRestClient:
         response = self._client.post("/ai_requests", json=kwargs)
         response.raise_for_status()
 
+    def queue_discord_alert(
+        self,
+        item: NewsItem,
+        drafts: list[Draft],
+        score: Score,
+    ) -> None:
+        if not item.id:
+            return
+        payload = {
+            "news_item_id": item.id,
+            "status": "pending",
+            "payload": _discord_payload(item, drafts, score),
+        }
+        response = self._client.post(
+            "/discord_alerts?on_conflict=news_item_id",
+            json=payload,
+            headers={"Prefer": "resolution=ignore-duplicates,return=minimal"},
+        )
+        response.raise_for_status()
+
+    def load_pending_discord_alerts(self, limit: int) -> list[DiscordAlert]:
+        if limit <= 0:
+            return []
+        response = self._client.get(
+            "/discord_alerts",
+            params={
+                "select": "id,news_item_id,payload",
+                "status": "eq.pending",
+                "next_attempt_at": f"lte.{datetime.now(timezone.utc).isoformat()}",
+                "order": "created_at.asc",
+                "limit": str(limit),
+            },
+        )
+        response.raise_for_status()
+        return [
+            DiscordAlert(
+                id=row["id"],
+                news_item_id=row["news_item_id"],
+                payload=row["payload"],
+            )
+            for row in response.json()
+        ]
+
+    def mark_discord_alerts_sent(self, alert_ids: list[str]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self._mark_discord_alerts_attempted(
+            alert_ids,
+            {
+                "status": "sent",
+                "sent_at": now,
+                "updated_at": now,
+                "last_error": None,
+                "last_status_code": None,
+            },
+        )
+
+    def mark_discord_alerts_retry(
+        self,
+        alert_ids: list[str],
+        retry_after_seconds: float,
+        error: str,
+        status_code: int | None,
+    ) -> None:
+        next_attempt_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=retry_after_seconds)
+        ).isoformat()
+        self._mark_discord_alerts_attempted(
+            alert_ids,
+            {
+                "status": "pending",
+                "next_attempt_at": next_attempt_at,
+                "last_error": error,
+                "last_status_code": status_code,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def mark_discord_alerts_failed(
+        self,
+        alert_ids: list[str],
+        error: str,
+        status_code: int | None,
+    ) -> None:
+        self._mark_discord_alerts_attempted(
+            alert_ids,
+            {
+                "status": "failed",
+                "last_error": error,
+                "last_status_code": status_code,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def delete_old_logs(self, cutoff: datetime, limit: int) -> int:
+        ids = self._select_ids(
+            "/logs",
+            {
+                "created_at": f"lt.{cutoff.isoformat()}",
+                "order": "created_at.asc",
+                "limit": str(limit),
+            },
+        )
+        return self._delete_rows_by_ids("/logs", ids)
+
+    def strip_old_ai_raw_responses(self, cutoff: datetime, limit: int) -> int:
+        ids = self._select_ids_with_non_null_fields(
+            "/ai_requests",
+            {"created_at": f"lt.{cutoff.isoformat()}", "order": "created_at.asc"},
+            ["raw_response"],
+            limit,
+        )
+        return self._patch_rows_by_ids("/ai_requests", ids, {"raw_response": None})
+
+    def strip_old_low_priority_news_fields(self, cutoff: datetime, limit: int) -> int:
+        ids = self._select_ids_with_non_null_fields(
+            "/news_items",
+            {
+                "status": "eq.low_priority",
+                "created_at": f"lt.{cutoff.isoformat()}",
+                "order": "created_at.asc",
+            },
+            ["raw_summary", "importance_reason"],
+            limit,
+        )
+        return self._patch_rows_by_ids(
+            "/news_items",
+            ids,
+            {"raw_summary": None, "importance_reason": None},
+        )
+
+    def delete_old_success_worker_runs(self, cutoff: datetime, limit: int) -> int:
+        ids = self._select_ids(
+            "/worker_runs",
+            {
+                "status": "eq.success",
+                "finished_at": f"lt.{cutoff.isoformat()}",
+                "order": "finished_at.asc",
+                "limit": str(limit),
+            },
+        )
+        return self._delete_rows_by_ids("/worker_runs", ids)
+
+    def get_storage_usage_snapshot(self) -> dict[str, Any]:
+        return {
+            "object_count": None,
+            "total_bytes": None,
+            "query_path": "supabase/queries/storage_audit.sql",
+        }
+
     def log_event(
         self,
         level: str,
@@ -232,12 +381,141 @@ class SupabaseRestClient:
     def close(self) -> None:
         self._client.close()
 
+    def _mark_discord_alerts_attempted(
+        self,
+        alert_ids: list[str],
+        patch_payload: dict[str, Any],
+    ) -> None:
+        for row in self._load_discord_alert_attempts(alert_ids):
+            self._patch_rows_by_ids(
+                "/discord_alerts",
+                [row["id"]],
+                {**patch_payload, "attempts": int(row.get("attempts") or 0) + 1},
+            )
+
+    def _load_discord_alert_attempts(self, alert_ids: list[str]) -> list[dict[str, Any]]:
+        if not alert_ids:
+            return []
+        response = self._client.get(
+            "/discord_alerts",
+            params={
+                "select": "id,attempts",
+                "id": _in_filter(alert_ids),
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _select_ids(self, path: str, params: dict[str, str]) -> list[str]:
+        response = self._client.get(
+            path,
+            params={"select": "id", **params},
+        )
+        response.raise_for_status()
+        return [row["id"] for row in response.json()]
+
+    def _select_ids_with_non_null_fields(
+        self,
+        path: str,
+        base_params: dict[str, str],
+        field_names: list[str],
+        limit: int,
+    ) -> list[str]:
+        if limit <= 0:
+            return []
+
+        ids: list[str] = []
+        page_size = max(limit * 3, 10)
+        offset = 0
+        select_fields = ",".join(["id", *field_names])
+
+        while len(ids) < limit:
+            response = self._client.get(
+                path,
+                params={
+                    "select": select_fields,
+                    **base_params,
+                    "limit": str(page_size),
+                    "offset": str(offset),
+                },
+            )
+            response.raise_for_status()
+            rows = response.json()
+            if not rows:
+                break
+            for row in rows:
+                if any(row.get(field_name) is not None for field_name in field_names):
+                    ids.append(row["id"])
+                    if len(ids) >= limit:
+                        break
+            if len(rows) < page_size:
+                break
+            offset += page_size
+
+        return ids
+
+    def _patch_rows_by_ids(
+        self,
+        path: str,
+        ids: list[str],
+        payload: dict[str, Any],
+    ) -> int:
+        if not ids:
+            return 0
+        response = self._client.patch(
+            path,
+            params={"id": _in_filter(ids)},
+            json=payload,
+            headers={"Prefer": "return=minimal"},
+        )
+        response.raise_for_status()
+        return len(ids)
+
+    def _delete_rows_by_ids(self, path: str, ids: list[str]) -> int:
+        if not ids:
+            return 0
+        response = self._client.delete(
+            path,
+            params={"id": _in_filter(ids)},
+            headers={"Prefer": "return=minimal"},
+        )
+        response.raise_for_status()
+        return len(ids)
+
 
 def _content_range_count(response: httpx.Response) -> int:
     content_range = response.headers.get("content-range", "")
     if "/" not in content_range:
         return len(response.json())
     return int(content_range.rsplit("/", 1)[1])
+
+
+def _in_filter(ids: list[str]) -> str:
+    return f"in.({','.join(ids)})"
+
+
+def _discord_payload(
+    item: NewsItem,
+    drafts: list[Draft],
+    score: Score,
+) -> dict[str, Any]:
+    short_post = next(
+        (draft.content for draft in drafts if draft.draft_type == "short_post"),
+        drafts[0].content if drafts else "",
+    )
+    why_it_matters = next(
+        (draft.content for draft in drafts if draft.draft_type == "why_it_matters"),
+        "",
+    )
+    return {
+        "title": item.title,
+        "source_name": item.source_name or "Unknown",
+        "score": item.importance_score,
+        "reason": score.reason,
+        "why_it_matters": why_it_matters,
+        "short_post": short_post,
+        "source_url": item.canonical_url,
+    }
 
 
 def _row_to_news_item(row: dict[str, Any]) -> NewsItem:

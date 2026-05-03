@@ -6,6 +6,9 @@ MIGRATION = ROOT / "supabase" / "migrations" / "001_initial_schema.sql"
 ADVISOR_CLEANUP_MIGRATION = (
     ROOT / "supabase" / "migrations" / "002_advisor_cleanup.sql"
 )
+RETENTION_DISCORD_MIGRATION = (
+    ROOT / "supabase" / "migrations" / "003_retention_discord_digest.sql"
+)
 
 
 def test_schema_has_strict_statuses_indexes_dedupe_and_rls():
@@ -58,3 +61,19 @@ def test_advisor_cleanup_indexes_foreign_keys():
     assert "on public.ai_requests (news_item_id)" in sql
     assert "create index if not exists posts_draft_id_idx" in sql
     assert "on public.posts (draft_id)" in sql
+
+
+def test_retention_and_discord_digest_schema():
+    sql = RETENTION_DISCORD_MIGRATION.read_text(encoding="utf-8").lower()
+
+    assert "create type public.discord_alert_status" in sql
+    assert "create table if not exists public.discord_alerts" in sql
+    assert "news_item_id uuid not null references public.news_items(id) on delete cascade" in sql
+    assert "payload jsonb not null" in sql
+    assert "unique (news_item_id)" in sql
+    assert "discord_alerts_pending_idx" in sql
+    assert "logs_created_at_idx" in sql
+    assert "ai_requests_created_at_idx" in sql
+    assert "worker_runs_finished_at_idx" in sql
+    assert "news_items_status_created_at_idx" in sql
+    assert "alter table public.discord_alerts enable row level security" in sql

@@ -59,6 +59,13 @@ def smoke_settings():
         run_timeout_seconds=60,
         request_timeout_seconds=1,
         openrouter_daily_free_request_limit=10,
+        cleanup_enabled=True,
+        retention_log_days=30,
+        retention_ai_raw_response_days=14,
+        retention_low_priority_days=30,
+        retention_worker_run_days=90,
+        cleanup_batch_limit=100,
+        discord_max_items_per_digest=10,
     )
 
 

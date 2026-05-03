@@ -39,6 +39,13 @@ class Settings:
     run_timeout_seconds: int
     request_timeout_seconds: int
     openrouter_daily_free_request_limit: int
+    cleanup_enabled: bool
+    retention_log_days: int
+    retention_ai_raw_response_days: int
+    retention_low_priority_days: int
+    retention_worker_run_days: int
+    cleanup_batch_limit: int
+    discord_max_items_per_digest: int
 
 
 def load_settings() -> Settings:
@@ -67,4 +74,11 @@ def load_settings() -> Settings:
         openrouter_daily_free_request_limit=_int_env(
             "OPENROUTER_DAILY_FREE_REQUEST_LIMIT", 50
         ),
+        cleanup_enabled=_bool_env("CLEANUP_ENABLED", True),
+        retention_log_days=_int_env("RETENTION_LOG_DAYS", 30),
+        retention_ai_raw_response_days=_int_env("RETENTION_AI_RAW_RESPONSE_DAYS", 14),
+        retention_low_priority_days=_int_env("RETENTION_LOW_PRIORITY_DAYS", 30),
+        retention_worker_run_days=_int_env("RETENTION_WORKER_RUN_DAYS", 90),
+        cleanup_batch_limit=_int_env("CLEANUP_BATCH_LIMIT", 100),
+        discord_max_items_per_digest=_int_env("DISCORD_MAX_ITEMS_PER_DIGEST", 10),
     )

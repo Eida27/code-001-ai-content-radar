@@ -17,7 +17,12 @@ from worker.processing.draft_generator import DraftParseError, parse_ai_draft_re
 from worker.processing.dedupe import dedupe_in_memory
 from worker.processing.normalize import normalize_items
 from worker.processing.scorer import score_item
-from worker.services.discord_notifier import DiscordNotifier
+from worker.services.cleanup import run_retention_cleanup
+from worker.services.discord_notifier import (
+    DiscordHardFailure,
+    DiscordNotifier,
+    DiscordRateLimitError,
+)
 from worker.services.openrouter_client import OpenRouterClient, OpenRouterRateLimitError
 from worker.services.supabase_client import DuplicateItemError, SupabaseRestClient
 from worker.sources import load_active_sources
@@ -164,6 +169,9 @@ def run_worker(
                     drafts_created_today += 1
                 elif draft_attempt.status == "rate_limited":
                     ai_disabled_for_run = True
+
+        _send_discord_digest_if_any(db=db, discord=discord, settings=settings)
+        _run_retention_cleanup_if_enabled(db=db, settings=settings, deadline=deadline)
 
         db.finish_worker_run(
             run_id,
@@ -429,12 +437,12 @@ def _draft_item(
     saved_item.status = "needs_review"
 
     try:
-        discord.send_alert(saved_item, draft_package.drafts, score)
+        db.queue_discord_alert(saved_item, draft_package.drafts, score)
     except Exception as error:
         db.log_event(
             "error",
             "discord",
-            f"Discord webhook failed: {error}",
+            f"Discord alert queue failed: {error}",
             {"news_item_title": saved_item.title},
         )
 
@@ -455,6 +463,108 @@ def _free_model_budget_exhausted(settings: Settings, free_requests_today: int) -
 
 def _run_ai_budget_exhausted(settings: Settings, ai_calls_this_run: int) -> bool:
     return ai_calls_this_run >= settings.max_ai_calls_per_run
+
+
+def _send_discord_digest_if_any(*, db: Any, discord: Any, settings: Settings) -> None:
+    if settings.discord_max_items_per_digest <= 0:
+        return
+
+    loader = getattr(db, "load_pending_discord_alerts", None)
+    if not callable(loader):
+        return
+
+    alerts = loader(settings.discord_max_items_per_digest)
+    if not alerts:
+        return
+
+    alert_ids = [alert.id for alert in alerts]
+    try:
+        discord.send_digest(alerts)
+    except DiscordRateLimitError as error:
+        _safe_mark_discord_retry(db, alert_ids, error.retry_after_seconds, str(error), 429)
+        db.log_event(
+            "warning",
+            "discord",
+            "Discord webhook rate-limited; digest retry scheduled",
+            {
+                "retry_after_seconds": error.retry_after_seconds,
+                "alert_count": len(alert_ids),
+            },
+        )
+    except DiscordHardFailure as error:
+        _safe_mark_discord_failed(db, alert_ids, str(error), error.status_code)
+        db.log_event(
+            "error",
+            "discord",
+            "Discord webhook hard failure; alerts marked failed",
+            {"status_code": error.status_code, "alert_count": len(alert_ids)},
+        )
+    except Exception as error:
+        _safe_mark_discord_retry(db, alert_ids, 300, str(error), None)
+        db.log_event(
+            "error",
+            "discord",
+            f"Discord digest failed: {error}",
+            {"alert_count": len(alert_ids)},
+        )
+    else:
+        marker = getattr(db, "mark_discord_alerts_sent", None)
+        if callable(marker):
+            marker(alert_ids)
+
+
+def _safe_mark_discord_retry(
+    db: Any,
+    alert_ids: list[str],
+    retry_after_seconds: float,
+    error: str,
+    status_code: int | None,
+) -> None:
+    marker = getattr(db, "mark_discord_alerts_retry", None)
+    if callable(marker):
+        marker(alert_ids, retry_after_seconds, error, status_code)
+
+
+def _safe_mark_discord_failed(
+    db: Any,
+    alert_ids: list[str],
+    error: str,
+    status_code: int | None,
+) -> None:
+    marker = getattr(db, "mark_discord_alerts_failed", None)
+    if callable(marker):
+        marker(alert_ids, error, status_code)
+
+
+def _run_retention_cleanup_if_enabled(
+    *,
+    db: Any,
+    settings: Settings,
+    deadline: float,
+) -> None:
+    if not settings.cleanup_enabled:
+        return
+    if time.monotonic() >= deadline:
+        db.log_event(
+            "warning",
+            "cleanup",
+            "Retention cleanup skipped because run deadline was reached",
+        )
+        return
+
+    try:
+        result = run_retention_cleanup(db, settings)
+    except Exception as error:
+        db.log_event("error", "cleanup", f"Retention cleanup failed: {error}")
+        return
+
+    if not result.skipped:
+        db.log_event(
+            "info",
+            "cleanup",
+            "Retention cleanup completed",
+            result.to_metadata(),
+        )
 
 
 def _save_item_or_skip(db: Any, item: Any, status: str) -> Any | None:

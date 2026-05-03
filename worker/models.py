@@ -61,3 +61,10 @@ class DraftPackage:
     drafts: list[Draft]
     raw_response: str
     parse_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordAlert:
+    id: str
+    news_item_id: str
+    payload: dict[str, Any]

@@ -58,3 +58,17 @@ Run a live smoke check without generating AI drafts or sending Discord messages:
 ```powershell
 .\.venv\Scripts\python -m worker.smoke
 ```
+
+## Storage And Notification Safety
+
+The worker sends Discord review notices as one digest per run instead of one
+message per item. This keeps webhook traffic low and lets Discord rate-limit
+responses schedule a later retry.
+
+Retention cleanup is enabled by default and only trims old operational data:
+logs older than 30 days, raw AI responses older than 14 days, bulky fields on
+old low-priority items, and successful worker run records older than 90 days.
+Drafts and review-worthy news items are kept for manual posting.
+
+To audit Supabase Storage bucket usage without deleting anything, run the query
+in `supabase/queries/storage_audit.sql` from the Supabase SQL editor.

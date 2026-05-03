@@ -20,6 +20,13 @@ class FakeSettings:
     source_timeout_seconds = 1
     source_retry_limit = 1
     run_timeout_seconds = 60
+    cleanup_enabled = True
+    retention_log_days = 30
+    retention_ai_raw_response_days = 14
+    retention_low_priority_days = 30
+    retention_worker_run_days = 90
+    cleanup_batch_limit = 100
+    discord_max_items_per_digest = 10
 
 
 class FakeDB:
@@ -29,6 +36,10 @@ class FakeDB:
         self.items = []
         self.drafts = []
         self.ai_requests = []
+        self.discord_alerts = []
+        self.sent_discord_alert_ids = []
+        self.retry_discord_alerts = []
+        self.failed_discord_alerts = []
         self.finished = []
         self.closed = False
 
@@ -65,6 +76,72 @@ class FakeDB:
 
     def save_ai_request(self, **kwargs):
         self.ai_requests.append(kwargs)
+
+    def queue_discord_alert(self, item, drafts, score):
+        self.discord_alerts.append((item, drafts, score))
+
+    def load_pending_discord_alerts(self, limit):
+        return [
+            type(
+                "Alert",
+                (),
+                {
+                    "id": f"alert-{index}",
+                    "news_item_id": item.id or f"item-{index}",
+                    "payload": {
+                        "title": item.title,
+                        "source_name": item.source_name,
+                        "score": item.importance_score,
+                        "reason": score.reason,
+                        "why_it_matters": next(
+                            (
+                                draft.content
+                                for draft in drafts
+                                if draft.draft_type == "why_it_matters"
+                            ),
+                            "",
+                        ),
+                        "short_post": next(
+                            (
+                                draft.content
+                                for draft in drafts
+                                if draft.draft_type == "short_post"
+                            ),
+                            "",
+                        ),
+                        "source_url": item.canonical_url,
+                    },
+                },
+            )()
+            for index, (item, drafts, score) in enumerate(self.discord_alerts[:limit], start=1)
+            if f"alert-{index}" not in self.sent_discord_alert_ids
+        ]
+
+    def mark_discord_alerts_sent(self, alert_ids):
+        self.sent_discord_alert_ids.extend(alert_ids)
+
+    def mark_discord_alerts_retry(self, alert_ids, retry_after_seconds, error, status_code):
+        self.retry_discord_alerts.append(
+            (alert_ids, retry_after_seconds, error, status_code)
+        )
+
+    def mark_discord_alerts_failed(self, alert_ids, error, status_code):
+        self.failed_discord_alerts.append((alert_ids, error, status_code))
+
+    def delete_old_logs(self, cutoff, limit):
+        return 0
+
+    def strip_old_ai_raw_responses(self, cutoff, limit):
+        return 0
+
+    def strip_old_low_priority_news_fields(self, cutoff, limit):
+        return 0
+
+    def delete_old_success_worker_runs(self, cutoff, limit):
+        return 0
+
+    def get_storage_usage_snapshot(self):
+        return {"object_count": 0, "total_bytes": 0}
 
     def log_event(self, level, module, message, metadata=None):
         self.logs.append((level, module, message, metadata or {}))
@@ -120,10 +197,14 @@ class FakeOpenRouter:
 class FakeDiscord:
     def __init__(self):
         self.alerts = []
+        self.digests = []
         self.closed = False
 
     def send_alert(self, item, drafts, score):
         self.alerts.append((item, drafts, score))
+
+    def send_digest(self, alerts):
+        self.digests.append(list(alerts))
 
     def close(self):
         self.closed = True
@@ -179,7 +260,8 @@ def test_source_failure_is_logged_and_other_sources_continue():
     assert len(db.items) == 1
     assert db.finished[-1][1] == "success"
     assert any("feed down" in log[2] for log in db.logs)
-    assert discord.alerts
+    assert not discord.alerts
+    assert len(discord.digests) == 1
     assert db.closed is True
     assert openrouter.closed is True
     assert discord.closed is True
@@ -210,6 +292,7 @@ def test_rate_limit_stops_ai_generation_for_rest_of_run():
     assert db.items[1].status == "scored"
     assert db.ai_requests[0]["status"] == "rate_limited"
     assert not discord.alerts
+    assert not discord.digests
 
 
 def test_invalid_ai_json_is_stored_as_parse_error_and_draft_failed():
@@ -232,6 +315,7 @@ def test_invalid_ai_json_is_stored_as_parse_error_and_draft_failed():
     assert db.ai_requests[0]["raw_response"] == '{"short_post": "broken"'
     assert db.ai_requests[0]["parse_error"]
     assert not db.drafts
+    assert not discord.digests
 
 
 def test_duplicate_insert_conflict_is_logged_and_run_continues():
@@ -257,7 +341,7 @@ def test_duplicate_insert_conflict_is_logged_and_run_continues():
     assert len(db.items) == 1
     assert db.finished[-1][1] == "success"
     assert any("Duplicate item skipped" in log[2] for log in db.logs)
-    assert discord.alerts
+    assert len(discord.digests) == 1
 
 
 def test_worker_retries_existing_scored_items_after_rate_limit_recovers():
@@ -280,7 +364,7 @@ def test_worker_retries_existing_scored_items_after_rate_limit_recovers():
 
     assert openrouter.calls == 1
     assert db.drafts
-    assert discord.alerts
+    assert len(discord.digests) == 1
 
 
 def test_paid_fallback_model_is_used_only_when_enabled():
@@ -307,7 +391,7 @@ def test_paid_fallback_model_is_used_only_when_enabled():
     assert db.drafts
     assert db.ai_requests[-1]["status"] == "success"
     assert db.ai_requests[-1]["model_used"] == settings.openrouter_fallback_model
-    assert discord.alerts
+    assert len(discord.digests) == 1
 
 
 def test_paid_fallbacks_stop_at_per_run_cap():
@@ -403,3 +487,53 @@ def test_worker_marks_run_error_when_interrupted():
 
     assert db.finished[-1][1] == "error"
     assert db.finished[-1][2]["error_type"] == "KeyboardInterrupt"
+
+
+def test_worker_queues_alerts_and_sends_one_discord_digest_per_run():
+    source = official_source()
+    db = FakeDB([source])
+    fetcher = FakeFetcher(
+        items=[
+            major_item("https://openai.com/news/model-1"),
+            major_item("https://openai.com/news/model-2"),
+        ]
+    )
+    openrouter = FakeOpenRouter([VALID_AI_JSON, VALID_AI_JSON])
+    discord = FakeDiscord()
+
+    run_worker(
+        settings=FakeSettings(),
+        db=db,
+        fetchers={"rss": fetcher},
+        openrouter=openrouter,
+        discord=discord,
+    )
+
+    assert len(db.discord_alerts) == 2
+    assert not discord.alerts
+    assert len(discord.digests) == 1
+    assert len(discord.digests[0]) == 2
+    assert db.sent_discord_alert_ids == ["alert-1", "alert-2"]
+
+
+def test_cleanup_failure_is_logged_without_failing_worker_run():
+    class CleanupFailingDB(FakeDB):
+        def delete_old_logs(self, cutoff, limit):
+            raise RuntimeError("cleanup exploded")
+
+    source = official_source()
+    db = CleanupFailingDB([source])
+    fetcher = FakeFetcher(items=[])
+    openrouter = FakeOpenRouter([])
+    discord = FakeDiscord()
+
+    run_worker(
+        settings=FakeSettings(),
+        db=db,
+        fetchers={"rss": fetcher},
+        openrouter=openrouter,
+        discord=discord,
+    )
+
+    assert db.finished[-1][1] == "success"
+    assert any("Retention cleanup failed" in log[2] for log in db.logs)
