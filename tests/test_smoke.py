@@ -52,6 +52,8 @@ def smoke_settings():
         min_importance_score=7,
         max_ai_drafts_per_day=35,
         max_items_per_run=30,
+        max_ai_calls_per_run=4,
+        max_paid_fallbacks_per_run=1,
         source_timeout_seconds=1,
         source_retry_limit=1,
         run_timeout_seconds=60,

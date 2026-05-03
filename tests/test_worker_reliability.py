@@ -11,6 +11,8 @@ class FakeSettings:
     min_importance_score = 7
     max_ai_drafts_per_day = 35
     max_items_per_run = 30
+    max_ai_calls_per_run = 10
+    max_paid_fallbacks_per_run = 3
     openrouter_default_model = "google/gemma-4-31b-it:free"
     openrouter_fallback_model = "google/gemma-4-31b-it"
     allow_paid_fallback = False
@@ -107,7 +109,7 @@ class FakeOpenRouter:
     def generate_draft(self, item, score):
         self.calls += 1
         response = self.responses.pop(0)
-        if isinstance(response, Exception):
+        if isinstance(response, BaseException):
             raise response
         return response
 
@@ -306,3 +308,98 @@ def test_paid_fallback_model_is_used_only_when_enabled():
     assert db.ai_requests[-1]["status"] == "success"
     assert db.ai_requests[-1]["model_used"] == settings.openrouter_fallback_model
     assert discord.alerts
+
+
+def test_paid_fallbacks_stop_at_per_run_cap():
+    settings = FakeSettings()
+    settings.allow_paid_fallback = True
+    settings.max_paid_fallbacks_per_run = 1
+    source = official_source()
+    db = FakeDB([source])
+    fetcher = FakeFetcher(
+        items=[
+            major_item("https://openai.com/news/model-1"),
+            major_item("https://openai.com/news/model-2"),
+        ]
+    )
+    openrouter = FakeOpenRouter(
+        [
+            OpenRouterRateLimitError("429 rate limit"),
+            OpenRouterRateLimitError("429 rate limit"),
+        ]
+    )
+    fallback_openrouter = FakeOpenRouter([VALID_AI_JSON, VALID_AI_JSON])
+    discord = FakeDiscord()
+
+    run_worker(
+        settings=settings,
+        db=db,
+        fetchers={"rss": fetcher},
+        openrouter=openrouter,
+        fallback_openrouter=fallback_openrouter,
+        discord=discord,
+    )
+
+    assert openrouter.calls == 2
+    assert fallback_openrouter.calls == 1
+    assert len(db.drafts) == 5
+    assert any("Paid fallback limit reached" in log[2] for log in db.logs)
+
+
+def test_total_ai_calls_stop_at_per_run_cap_even_with_fallback():
+    settings = FakeSettings()
+    settings.allow_paid_fallback = True
+    settings.max_ai_calls_per_run = 2
+    settings.max_paid_fallbacks_per_run = 5
+    source = official_source()
+    db = FakeDB([source])
+    fetcher = FakeFetcher(
+        items=[
+            major_item("https://openai.com/news/model-1"),
+            major_item("https://openai.com/news/model-2"),
+        ]
+    )
+    openrouter = FakeOpenRouter(
+        [
+            OpenRouterRateLimitError("429 rate limit"),
+            OpenRouterRateLimitError("429 rate limit"),
+        ]
+    )
+    fallback_openrouter = FakeOpenRouter([VALID_AI_JSON, VALID_AI_JSON])
+    discord = FakeDiscord()
+
+    run_worker(
+        settings=settings,
+        db=db,
+        fetchers={"rss": fetcher},
+        openrouter=openrouter,
+        fallback_openrouter=fallback_openrouter,
+        discord=discord,
+    )
+
+    assert openrouter.calls == 1
+    assert fallback_openrouter.calls == 1
+    assert len(db.drafts) == 5
+    assert any("Per-run AI call limit reached" in log[2] for log in db.logs)
+
+
+def test_worker_marks_run_error_when_interrupted():
+    source = official_source()
+    db = FakeDB([source])
+    fetcher = FakeFetcher(items=[major_item()])
+    openrouter = FakeOpenRouter([KeyboardInterrupt()])
+    discord = FakeDiscord()
+
+    try:
+        run_worker(
+            settings=FakeSettings(),
+            db=db,
+            fetchers={"rss": fetcher},
+            openrouter=openrouter,
+            discord=discord,
+        )
+    except KeyboardInterrupt:
+        pass
+
+    assert db.finished[-1][1] == "error"
+    assert db.finished[-1][2]["error_type"] == "KeyboardInterrupt"

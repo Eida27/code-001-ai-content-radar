@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,13 @@ from worker.services.supabase_client import DuplicateItemError, SupabaseRestClie
 from worker.sources import load_active_sources
 
 
+@dataclass(slots=True)
+class DraftAttempt:
+    status: str
+    ai_calls_used: int = 0
+    paid_fallbacks_used: int = 0
+
+
 def run_worker(
     *,
     settings: Settings,
@@ -35,22 +43,31 @@ def run_worker(
     deadline = time.monotonic() + settings.run_timeout_seconds
     drafts_created_today = db.count_drafts_created_today()
     free_requests_today = db.count_ai_requests_today(settings.openrouter_default_model)
+    ai_calls_this_run = 0
+    paid_fallbacks_this_run = 0
     ai_disabled_for_run = False
     processed_items = 0
 
     try:
-        ai_disabled_for_run, drafts_created_today, free_requests_today = (
-            _process_retryable_scored_items(
-                settings=settings,
-                db=db,
-                openrouter=openrouter,
-                fallback_openrouter=fallback_openrouter,
-                discord=discord,
-                ai_disabled_for_run=ai_disabled_for_run,
-                drafts_created_today=drafts_created_today,
-                free_requests_today=free_requests_today,
-            )
+        (
+            ai_disabled_for_run,
+            drafts_created_today,
+            free_requests_today,
+            run_state,
+        ) = _process_retryable_scored_items(
+            settings=settings,
+            db=db,
+            openrouter=openrouter,
+            fallback_openrouter=fallback_openrouter,
+            discord=discord,
+            ai_disabled_for_run=ai_disabled_for_run,
+            drafts_created_today=drafts_created_today,
+            free_requests_today=free_requests_today,
+            ai_calls_this_run=ai_calls_this_run,
+            paid_fallbacks_this_run=paid_fallbacks_this_run,
         )
+        ai_calls_this_run = run_state["ai_calls_this_run"]
+        paid_fallbacks_this_run = run_state["paid_fallbacks_this_run"]
 
         sources = load_active_sources(db)
         for source in sources:
@@ -115,10 +132,19 @@ def run_worker(
                     )
                     ai_disabled_for_run = True
 
+                if _run_ai_budget_exhausted(settings, ai_calls_this_run):
+                    db.log_event(
+                        "warning",
+                        "openrouter",
+                        "Per-run AI call limit reached",
+                        {"max_ai_calls_per_run": settings.max_ai_calls_per_run},
+                    )
+                    ai_disabled_for_run = True
+
                 if ai_disabled_for_run:
                     continue
 
-                draft_status = _draft_item(
+                draft_attempt = _draft_item(
                     db=db,
                     openrouter=openrouter,
                     fallback_openrouter=fallback_openrouter,
@@ -127,12 +153,16 @@ def run_worker(
                     saved_item=saved_item,
                     score=score,
                     model_used=settings.openrouter_default_model,
+                    ai_calls_this_run=ai_calls_this_run,
+                    paid_fallbacks_this_run=paid_fallbacks_this_run,
                 )
-                if draft_status in {"success", "rate_limited", "error"}:
+                ai_calls_this_run += draft_attempt.ai_calls_used
+                paid_fallbacks_this_run += draft_attempt.paid_fallbacks_used
+                if draft_attempt.ai_calls_used:
                     free_requests_today += 1
-                if draft_status == "success":
+                if draft_attempt.status == "success":
                     drafts_created_today += 1
-                elif draft_status == "rate_limited":
+                elif draft_attempt.status == "rate_limited":
                     ai_disabled_for_run = True
 
         db.finish_worker_run(
@@ -140,9 +170,13 @@ def run_worker(
             status="success",
             metadata={"items_processed": processed_items},
         )
-    except Exception as error:
+    except BaseException as error:
         db.log_event("error", "worker", f"Worker run failed: {error}")
-        db.finish_worker_run(run_id, status="error", metadata={"error": str(error)})
+        db.finish_worker_run(
+            run_id,
+            status="error",
+            metadata={"error": str(error), "error_type": type(error).__name__},
+        )
         raise
     finally:
         _close_resources(db, openrouter, fallback_openrouter, discord, fetchers)
@@ -189,10 +223,20 @@ def _process_retryable_scored_items(
     ai_disabled_for_run: bool,
     drafts_created_today: int,
     free_requests_today: int,
-) -> tuple[bool, int, int]:
+    ai_calls_this_run: int,
+    paid_fallbacks_this_run: int,
+) -> tuple[bool, int, int, dict[str, int]]:
     retry_loader = getattr(db, "load_items_ready_for_drafting", None)
     if not callable(retry_loader):
-        return ai_disabled_for_run, drafts_created_today, free_requests_today
+        return (
+            ai_disabled_for_run,
+            drafts_created_today,
+            free_requests_today,
+            {
+                "ai_calls_this_run": ai_calls_this_run,
+                "paid_fallbacks_this_run": paid_fallbacks_this_run,
+            },
+        )
 
     retry_limit = max(settings.max_items_per_run, 0)
     retryable_items = retry_loader(retry_limit, settings.min_importance_score)
@@ -208,6 +252,14 @@ def _process_retryable_scored_items(
                 {"model": settings.openrouter_default_model},
             )
             break
+        if _run_ai_budget_exhausted(settings, ai_calls_this_run):
+            db.log_event(
+                "warning",
+                "openrouter",
+                "Per-run AI call limit reached",
+                {"max_ai_calls_per_run": settings.max_ai_calls_per_run},
+            )
+            break
         if ai_disabled_for_run:
             break
 
@@ -215,7 +267,7 @@ def _process_retryable_scored_items(
             value=saved_item.importance_score or settings.min_importance_score,
             reason=saved_item.importance_reason or "Retrying previously scored item",
         )
-        draft_status = _draft_item(
+        draft_attempt = _draft_item(
             db=db,
             openrouter=openrouter,
             fallback_openrouter=fallback_openrouter,
@@ -224,15 +276,27 @@ def _process_retryable_scored_items(
             saved_item=saved_item,
             score=score,
             model_used=settings.openrouter_default_model,
+            ai_calls_this_run=ai_calls_this_run,
+            paid_fallbacks_this_run=paid_fallbacks_this_run,
         )
-        if draft_status in {"success", "rate_limited", "error"}:
+        ai_calls_this_run += draft_attempt.ai_calls_used
+        paid_fallbacks_this_run += draft_attempt.paid_fallbacks_used
+        if draft_attempt.ai_calls_used:
             free_requests_today += 1
-        if draft_status == "success":
+        if draft_attempt.status == "success":
             drafts_created_today += 1
-        elif draft_status == "rate_limited":
+        elif draft_attempt.status == "rate_limited":
             ai_disabled_for_run = True
 
-    return ai_disabled_for_run, drafts_created_today, free_requests_today
+    return (
+        ai_disabled_for_run,
+        drafts_created_today,
+        free_requests_today,
+        {
+            "ai_calls_this_run": ai_calls_this_run,
+            "paid_fallbacks_this_run": paid_fallbacks_this_run,
+        },
+    )
 
 
 def _draft_item(
@@ -245,7 +309,9 @@ def _draft_item(
     saved_item: Any,
     score: Score,
     model_used: str,
-) -> str:
+    ai_calls_this_run: int,
+    paid_fallbacks_this_run: int,
+) -> DraftAttempt:
     try:
         raw_response = openrouter.generate_draft(saved_item, score)
     except OpenRouterRateLimitError as error:
@@ -257,6 +323,27 @@ def _draft_item(
             parse_error=None,
         )
         if settings.allow_paid_fallback and fallback_openrouter is not None:
+            if paid_fallbacks_this_run >= settings.max_paid_fallbacks_per_run:
+                saved_item.status = "scored"
+                db.log_event(
+                    "warning",
+                    "openrouter",
+                    "Paid fallback limit reached; leaving item scored for retry",
+                    {
+                        "news_item_title": saved_item.title,
+                        "max_paid_fallbacks_per_run": settings.max_paid_fallbacks_per_run,
+                    },
+                )
+                return DraftAttempt("rate_limited", ai_calls_used=1)
+            if ai_calls_this_run + 1 >= settings.max_ai_calls_per_run:
+                saved_item.status = "scored"
+                db.log_event(
+                    "warning",
+                    "openrouter",
+                    "Per-run AI call limit reached before paid fallback",
+                    {"max_ai_calls_per_run": settings.max_ai_calls_per_run},
+                )
+                return DraftAttempt("rate_limited", ai_calls_used=1)
             db.log_event(
                 "warning",
                 "openrouter",
@@ -266,7 +353,7 @@ def _draft_item(
                     "fallback_model": settings.openrouter_fallback_model,
                 },
             )
-            return _draft_item(
+            fallback_attempt = _draft_item(
                 db=db,
                 openrouter=fallback_openrouter,
                 fallback_openrouter=None,
@@ -275,6 +362,13 @@ def _draft_item(
                 saved_item=saved_item,
                 score=score,
                 model_used=settings.openrouter_fallback_model,
+                ai_calls_this_run=ai_calls_this_run + 1,
+                paid_fallbacks_this_run=paid_fallbacks_this_run + 1,
+            )
+            return DraftAttempt(
+                fallback_attempt.status,
+                ai_calls_used=fallback_attempt.ai_calls_used + 1,
+                paid_fallbacks_used=fallback_attempt.paid_fallbacks_used,
             )
 
         saved_item.status = "scored"
@@ -284,7 +378,7 @@ def _draft_item(
             "OpenRouter rate limit reached; disabling AI for this run",
             {"news_item_title": saved_item.title},
         )
-        return "rate_limited"
+        return DraftAttempt("rate_limited", ai_calls_used=1)
     except Exception as error:
         db.save_ai_request(
             news_item_id=saved_item.id,
@@ -301,7 +395,7 @@ def _draft_item(
             f"AI draft generation failed: {error}",
             {"news_item_title": saved_item.title},
         )
-        return "error"
+        return DraftAttempt("error", ai_calls_used=1)
 
     try:
         draft_package = parse_ai_draft_response(raw_response, model_used=model_used)
@@ -321,7 +415,7 @@ def _draft_item(
             "AI response failed JSON validation",
             {"parse_error": error.parse_error},
         )
-        return "parse_error"
+        return DraftAttempt("parse_error", ai_calls_used=1)
 
     db.save_ai_request(
         news_item_id=saved_item.id,
@@ -344,7 +438,12 @@ def _draft_item(
             {"news_item_title": saved_item.title},
         )
 
-    return "success"
+    paid_fallback_used = 1 if model_used == settings.openrouter_fallback_model else 0
+    return DraftAttempt(
+        "success",
+        ai_calls_used=1,
+        paid_fallbacks_used=paid_fallback_used,
+    )
 
 
 def _free_model_budget_exhausted(settings: Settings, free_requests_today: int) -> bool:
@@ -352,6 +451,10 @@ def _free_model_budget_exhausted(settings: Settings, free_requests_today: int) -
         settings.openrouter_default_model.endswith(":free")
         and free_requests_today >= settings.openrouter_daily_free_request_limit
     )
+
+
+def _run_ai_budget_exhausted(settings: Settings, ai_calls_this_run: int) -> bool:
+    return ai_calls_this_run >= settings.max_ai_calls_per_run
 
 
 def _save_item_or_skip(db: Any, item: Any, status: str) -> Any | None:
