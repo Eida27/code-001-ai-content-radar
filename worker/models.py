@@ -13,6 +13,12 @@ class Source:
     url: str
     category: str | None = None
     priority: int = 5
+    last_checked_at: datetime | None = None
+    last_success_at: datetime | None = None
+    last_error_at: datetime | None = None
+    last_error_message: str | None = None
+    latest_feed_published_at: datetime | None = None
+    latest_stored_published_at: datetime | None = None
 
 
 @dataclass(slots=True)

@@ -11,6 +11,9 @@ class FakeSettings:
     min_importance_score = 7
     max_ai_drafts_per_day = 35
     max_items_per_run = 30
+    max_items_per_source = 10
+    max_feed_candidates_per_source = 30
+    freshness_window_hours = 72
     max_ai_calls_per_run = 10
     max_paid_fallbacks_per_run = 3
     openrouter_default_model = "google/gemma-4-31b-it:free"
@@ -37,6 +40,9 @@ class FakeDB:
         self.drafts = []
         self.ai_requests = []
         self.discord_alerts = []
+        self.source_checks = []
+        self.source_successes = []
+        self.source_failures = []
         self.sent_discord_alert_ids = []
         self.retry_discord_alerts = []
         self.failed_discord_alerts = []
@@ -65,6 +71,15 @@ class FakeDB:
         item.status = status
         self.items.append(item)
         return item
+
+    def mark_source_check_started(self, source_id):
+        self.source_checks.append(source_id)
+
+    def mark_source_check_success(self, source_id, latest_feed_published_at=None):
+        self.source_successes.append((source_id, latest_feed_published_at))
+
+    def mark_source_check_failure(self, source_id, error):
+        self.source_failures.append((source_id, str(error)))
 
     def update_item_status(self, item_id, status):
         if item_id is None:
@@ -162,6 +177,11 @@ class ConflictOnceDB(FakeDB):
         return super().save_item(item, status)
 
 
+class DuplicateDB(FakeDB):
+    def save_item(self, item, status):
+        raise DuplicateItemError("duplicate normalized_url_hash")
+
+
 class FakeFetcher:
     def __init__(self, items=None, error=None):
         self.items = items or []
@@ -226,6 +246,15 @@ def major_item(url="https://openai.com/news/model"):
         url=url,
         raw_summary="A useful update.",
         published_at=datetime(2026, 5, 3, tzinfo=timezone.utc),
+    )
+
+
+def dated_item(url, published_at, title="OpenAI launches new model API for developers"):
+    return RawItem(
+        title=title,
+        url=url,
+        raw_summary="A useful update for developers.",
+        published_at=published_at,
     )
 
 
@@ -537,3 +566,141 @@ def test_cleanup_failure_is_logged_without_failing_worker_run():
 
     assert db.finished[-1][1] == "success"
     assert any("Retention cleanup failed" in log[2] for log in db.logs)
+
+
+def test_duplicate_heavy_first_source_does_not_starve_later_sources():
+    openai = official_source("openai")
+    github = Source(
+        id="github",
+        name="GitHub Blog AI",
+        type="rss",
+        url="https://github.blog/feed/",
+        priority=7,
+    )
+    db = FakeDB([openai, github])
+
+    class DuplicateOpenAIDB(FakeDB):
+        def save_item(self, item, status):
+            if item.source_id == "openai":
+                raise DuplicateItemError("duplicate normalized_url_hash")
+            return super().save_item(item, status)
+
+    db = DuplicateOpenAIDB([openai, github])
+    fresh = datetime(2026, 5, 3, tzinfo=timezone.utc)
+    fetchers = {
+        "rss": {
+            "openai": FakeFetcher(
+                items=[
+                    dated_item(f"https://openai.com/news/old-{index}", fresh)
+                    for index in range(40)
+                ]
+            ),
+            "github": FakeFetcher(
+                items=[dated_item("https://github.blog/ai/copilot-cli", fresh)]
+            ),
+        }
+    }
+    openrouter = FakeOpenRouter([VALID_AI_JSON])
+    discord = FakeDiscord()
+
+    run_worker(
+        settings=FakeSettings(),
+        db=db,
+        fetchers=fetchers,
+        openrouter=openrouter,
+        discord=discord,
+    )
+
+    assert [item.source_id for item in db.items] == ["github"]
+    assert db.source_checks == ["openai", "github"]
+    assert openrouter.calls == 1
+    assert len(discord.digests) == 1
+
+
+def test_feed_entries_are_processed_newest_first_and_limited_per_source():
+    settings = FakeSettings()
+    settings.max_items_per_source = 2
+    settings.max_feed_candidates_per_source = 3
+    settings.max_ai_drafts_per_day = 0
+    source = official_source()
+    db = FakeDB([source])
+    fetcher = FakeFetcher(
+        items=[
+            dated_item(
+                "https://openai.com/news/older",
+                datetime(2026, 5, 1, tzinfo=timezone.utc),
+                "Older OpenAI API update",
+            ),
+            dated_item(
+                "https://openai.com/news/newest",
+                datetime(2026, 5, 3, tzinfo=timezone.utc),
+                "Newest OpenAI API update",
+            ),
+            dated_item(
+                "https://openai.com/news/middle",
+                datetime(2026, 5, 2, tzinfo=timezone.utc),
+                "Middle OpenAI API update",
+            ),
+        ]
+    )
+
+    run_worker(
+        settings=settings,
+        db=db,
+        fetchers={"rss": fetcher},
+        openrouter=FakeOpenRouter([]),
+        discord=FakeDiscord(),
+    )
+
+    assert [item.canonical_url for item in db.items] == [
+        "https://openai.com/news/newest",
+        "https://openai.com/news/middle",
+    ]
+
+
+def test_stale_items_are_stored_but_never_drafted_or_queued_for_discord():
+    source = official_source()
+    db = FakeDB([source])
+    stale = datetime(2026, 4, 25, tzinfo=timezone.utc)
+    fetcher = FakeFetcher(items=[dated_item("https://openai.com/news/stale", stale)])
+    openrouter = FakeOpenRouter([VALID_AI_JSON])
+    discord = FakeDiscord()
+
+    run_worker(
+        settings=FakeSettings(),
+        db=db,
+        fetchers={"rss": fetcher},
+        openrouter=openrouter,
+        discord=discord,
+    )
+
+    assert len(db.items) == 1
+    assert db.items[0].status == "scored"
+    assert openrouter.calls == 0
+    assert not db.drafts
+    assert not db.discord_alerts
+    assert not discord.digests
+
+
+def test_source_health_success_and_failure_are_recorded():
+    source_a = official_source("source-a")
+    source_b = official_source("source-b")
+    db = FakeDB([source_a, source_b])
+    fresh = datetime(2026, 5, 3, tzinfo=timezone.utc)
+
+    run_worker(
+        settings=FakeSettings(),
+        db=db,
+        fetchers={
+            "rss": {
+                "source-a": FakeFetcher(items=[dated_item("https://a.test/news", fresh)]),
+                "source-b": FakeFetcher(error=RuntimeError("timeout")),
+            }
+        },
+        openrouter=FakeOpenRouter([VALID_AI_JSON]),
+        discord=FakeDiscord(),
+    )
+
+    assert db.source_checks == ["source-a", "source-b"]
+    assert db.source_successes == [("source-a", fresh)]
+    assert db.source_failures == [("source-b", "timeout")]

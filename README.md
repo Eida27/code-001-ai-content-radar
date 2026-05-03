@@ -59,6 +59,12 @@ Run a live smoke check without generating AI drafts or sending Discord messages:
 .\.venv\Scripts\python -m worker.smoke
 ```
 
+Run a freshness audit without generating AI drafts or sending Discord messages:
+
+```powershell
+.\.venv\Scripts\python -m worker.freshness_audit
+```
+
 ## Storage And Notification Safety
 
 The worker sends Discord review notices as one digest per run instead of one
@@ -72,3 +78,17 @@ Drafts and review-worthy news items are kept for manual posting.
 
 To audit Supabase Storage bucket usage without deleting anything, run the query
 in `supabase/queries/storage_audit.sql` from the Supabase SQL editor.
+
+## Freshness Controls
+
+The worker processes each source newest-first, caps candidates per source, and
+uses a 72-hour freshness window before AI drafting or Discord digesting. This
+prevents a large duplicate-heavy feed from starving smaller sources.
+
+Important knobs:
+
+```text
+MAX_ITEMS_PER_SOURCE=10
+MAX_FEED_CANDIDATES_PER_SOURCE=30
+FRESHNESS_WINDOW_HOURS=72
+```

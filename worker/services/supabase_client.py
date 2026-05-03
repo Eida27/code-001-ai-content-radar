@@ -61,6 +61,16 @@ class SupabaseRestClient:
                 url=row["url"],
                 category=row.get("category"),
                 priority=row.get("priority") or 5,
+                last_checked_at=_parse_datetime(row.get("last_checked_at")),
+                last_success_at=_parse_datetime(row.get("last_success_at")),
+                last_error_at=_parse_datetime(row.get("last_error_at")),
+                last_error_message=row.get("last_error_message"),
+                latest_feed_published_at=_parse_datetime(
+                    row.get("latest_feed_published_at")
+                ),
+                latest_stored_published_at=_parse_datetime(
+                    row.get("latest_stored_published_at")
+                ),
             )
             for row in response.json()
         ]
@@ -187,6 +197,78 @@ class SupabaseRestClient:
             json={"status": status},
         )
         response.raise_for_status()
+
+    def mark_source_check_started(self, source_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        response = self._client.patch(
+            f"/sources?id=eq.{source_id}",
+            json={"last_checked_at": now, "updated_at": now},
+            headers={"Prefer": "return=minimal"},
+        )
+        response.raise_for_status()
+
+    def mark_source_check_success(
+        self,
+        source_id: str,
+        latest_feed_published_at: datetime | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        payload: dict[str, Any] = {
+            "last_success_at": now,
+            "last_error_message": None,
+            "updated_at": now,
+        }
+        if latest_feed_published_at is not None:
+            payload["latest_feed_published_at"] = latest_feed_published_at.isoformat()
+        response = self._client.patch(
+            f"/sources?id=eq.{source_id}",
+            json=payload,
+            headers={"Prefer": "return=minimal"},
+        )
+        response.raise_for_status()
+
+    def mark_source_check_failure(self, source_id: str, error: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        response = self._client.patch(
+            f"/sources?id=eq.{source_id}",
+            json={
+                "last_error_at": now,
+                "last_error_message": error[:500],
+                "updated_at": now,
+            },
+            headers={"Prefer": "return=minimal"},
+        )
+        response.raise_for_status()
+
+    def update_source_latest_stored_published_at(
+        self, source_id: str, latest_stored_published_at: datetime
+    ) -> None:
+        response = self._client.patch(
+            f"/sources?id=eq.{source_id}",
+            json={
+                "latest_stored_published_at": latest_stored_published_at.isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            headers={"Prefer": "return=minimal"},
+        )
+        response.raise_for_status()
+
+    def get_latest_stored_published_at_by_source(self, source_id: str) -> datetime | None:
+        response = self._client.get(
+            "/news_items",
+            params={
+                "select": "published_at",
+                "source_id": f"eq.{source_id}",
+                "published_at": "not.is.null",
+                "order": "published_at.desc",
+                "limit": "1",
+            },
+        )
+        response.raise_for_status()
+        rows = response.json()
+        if not rows:
+            return None
+        return _parse_datetime(rows[0].get("published_at"))
 
     def save_drafts(self, news_item_id: str | None, drafts: list[Draft]) -> None:
         if not news_item_id or not drafts:
@@ -490,6 +572,16 @@ def _content_range_count(response: httpx.Response) -> int:
     return int(content_range.rsplit("/", 1)[1])
 
 
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return None
+
+
 def _in_filter(ids: list[str]) -> str:
     return f"in.({','.join(ids)})"
 
@@ -519,9 +611,7 @@ def _discord_payload(
 
 
 def _row_to_news_item(row: dict[str, Any]) -> NewsItem:
-    published_at = row.get("published_at")
-    if isinstance(published_at, str):
-        published_at = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    published_at = _parse_datetime(row.get("published_at"))
 
     return NewsItem(
         id=row["id"],

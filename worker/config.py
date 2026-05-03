@@ -32,6 +32,9 @@ class Settings:
     min_importance_score: int
     max_ai_drafts_per_day: int
     max_items_per_run: int
+    max_items_per_source: int
+    max_feed_candidates_per_source: int
+    freshness_window_hours: int
     max_ai_calls_per_run: int
     max_paid_fallbacks_per_run: int
     source_timeout_seconds: int
@@ -65,6 +68,9 @@ def load_settings() -> Settings:
         min_importance_score=_int_env("MIN_IMPORTANCE_SCORE", 7),
         max_ai_drafts_per_day=_int_env("MAX_AI_DRAFTS_PER_DAY", 35),
         max_items_per_run=_int_env("MAX_ITEMS_PER_RUN", 30),
+        max_items_per_source=_int_env("MAX_ITEMS_PER_SOURCE", 10),
+        max_feed_candidates_per_source=_int_env("MAX_FEED_CANDIDATES_PER_SOURCE", 30),
+        freshness_window_hours=_int_env("FRESHNESS_WINDOW_HOURS", 72),
         max_ai_calls_per_run=_int_env("MAX_AI_CALLS_PER_RUN", 4),
         max_paid_fallbacks_per_run=_int_env("MAX_PAID_FALLBACKS_PER_RUN", 1),
         source_timeout_seconds=_int_env("SOURCE_TIMEOUT_SECONDS", 20),

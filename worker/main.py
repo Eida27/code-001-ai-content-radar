@@ -4,6 +4,7 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from worker.config import Settings, load_settings
+from worker.freshness import is_fresh_news_item, latest_published_at
 from worker.fetchers.rss_fetcher import RSSFetcher
 from worker.models import Score
 from worker.processing.draft_generator import DraftParseError, parse_ai_draft_response
@@ -51,7 +53,8 @@ def run_worker(
     ai_calls_this_run = 0
     paid_fallbacks_this_run = 0
     ai_disabled_for_run = False
-    processed_items = 0
+    items_inserted = 0
+    candidates_considered = 0
 
     try:
         (
@@ -75,6 +78,7 @@ def run_worker(
         paid_fallbacks_this_run = run_state["paid_fallbacks_this_run"]
 
         sources = load_active_sources(db)
+        per_source_insert_limit = _per_source_insert_limit(settings, len(sources))
         for source in sources:
             if time.monotonic() >= deadline:
                 db.log_event(
@@ -86,6 +90,7 @@ def run_worker(
                 break
 
             try:
+                _safe_mark_source_check_started(db, source.id)
                 fetcher = _resolve_fetcher(fetchers, source)
                 raw_items = fetcher.fetch(
                     source,
@@ -93,6 +98,7 @@ def run_worker(
                     retry_limit=settings.source_retry_limit,
                 )
             except Exception as error:
+                _safe_mark_source_check_failure(db, source.id, str(error))
                 db.log_event(
                     "error",
                     "fetcher",
@@ -101,22 +107,76 @@ def run_worker(
                 )
                 continue
 
-            items = dedupe_in_memory(normalize_items(raw_items, source))
+            source_latest_feed_published_at = latest_published_at(raw_items)
+            _safe_mark_source_check_success(
+                db,
+                source.id,
+                source_latest_feed_published_at,
+            )
+            items = _select_source_candidates(
+                dedupe_in_memory(normalize_items(raw_items, source)),
+                settings.max_feed_candidates_per_source,
+            )
+            source_items_inserted = 0
+            source_latest_stored_published_at: datetime | None = None
             for item in items:
-                if processed_items >= settings.max_items_per_run:
+                if source_items_inserted >= per_source_insert_limit:
                     break
-                processed_items += 1
+                if items_inserted >= settings.max_items_per_run:
+                    db.log_event(
+                        "info",
+                        "worker",
+                        "Global item insert limit reached",
+                        {"max_items_per_run": settings.max_items_per_run},
+                    )
+                    break
+                candidates_considered += 1
 
                 score = score_item(item, source)
                 item.importance_score = score.value
                 item.importance_reason = score.reason
 
                 if score.value < settings.min_importance_score:
-                    _save_item_or_skip(db, item, status="low_priority")
+                    saved_low_priority = _save_item_or_skip(
+                        db,
+                        item,
+                        status="low_priority",
+                    )
+                    if saved_low_priority is not None:
+                        items_inserted += 1
+                        source_items_inserted += 1
+                        source_latest_stored_published_at = _max_datetime(
+                            source_latest_stored_published_at,
+                            saved_low_priority.published_at,
+                        )
                     continue
 
                 saved_item = _save_item_or_skip(db, item, status="scored")
                 if saved_item is None:
+                    continue
+                items_inserted += 1
+                source_items_inserted += 1
+                source_latest_stored_published_at = _max_datetime(
+                    source_latest_stored_published_at,
+                    saved_item.published_at,
+                )
+
+                if not is_fresh_news_item(
+                    saved_item,
+                    settings.freshness_window_hours,
+                ):
+                    db.log_event(
+                        "info",
+                        "freshness",
+                        "Item stored but skipped for drafting because it is outside the freshness window",
+                        {
+                            "news_item_title": saved_item.title,
+                            "published_at": saved_item.published_at.isoformat()
+                            if saved_item.published_at
+                            else None,
+                            "freshness_window_hours": settings.freshness_window_hours,
+                        },
+                    )
                     continue
 
                 if drafts_created_today >= settings.max_ai_drafts_per_day:
@@ -170,13 +230,36 @@ def run_worker(
                 elif draft_attempt.status == "rate_limited":
                     ai_disabled_for_run = True
 
+            source_latest_stored_published_at = _load_latest_stored_published_at(
+                db,
+                source.id,
+                source_latest_stored_published_at,
+            )
+            if source_latest_stored_published_at is not None:
+                _safe_update_source_latest_stored(
+                    db,
+                    source.id,
+                    source_latest_stored_published_at,
+                )
+            _warn_if_fresh_source_looks_starved(
+                db,
+                source,
+                source_latest_feed_published_at,
+                source_items_inserted,
+                settings,
+            )
+
         _send_discord_digest_if_any(db=db, discord=discord, settings=settings)
         _run_retention_cleanup_if_enabled(db=db, settings=settings, deadline=deadline)
 
         db.finish_worker_run(
             run_id,
             status="success",
-            metadata={"items_processed": processed_items},
+            metadata={
+                "items_processed": items_inserted,
+                "items_inserted": items_inserted,
+                "candidates_considered": candidates_considered,
+            },
         )
     except BaseException as error:
         db.log_event("error", "worker", f"Worker run failed: {error}")
@@ -250,6 +333,20 @@ def _process_retryable_scored_items(
     retryable_items = retry_loader(retry_limit, settings.min_importance_score)
 
     for saved_item in retryable_items:
+        if not is_fresh_news_item(saved_item, settings.freshness_window_hours):
+            db.log_event(
+                "info",
+                "freshness",
+                "Retryable scored item skipped because it is outside the freshness window",
+                {
+                    "news_item_title": saved_item.title,
+                    "published_at": saved_item.published_at.isoformat()
+                    if saved_item.published_at
+                    else None,
+                    "freshness_window_hours": settings.freshness_window_hours,
+                },
+            )
+            continue
         if drafts_created_today >= settings.max_ai_drafts_per_day:
             break
         if _free_model_budget_exhausted(settings, free_requests_today):
@@ -463,6 +560,111 @@ def _free_model_budget_exhausted(settings: Settings, free_requests_today: int) -
 
 def _run_ai_budget_exhausted(settings: Settings, ai_calls_this_run: int) -> bool:
     return ai_calls_this_run >= settings.max_ai_calls_per_run
+
+
+def _per_source_insert_limit(settings: Settings, source_count: int) -> int:
+    if source_count <= 0:
+        return max(settings.max_items_per_source, 0)
+    fair_share = max(settings.max_items_per_run // source_count, 1)
+    return max(min(settings.max_items_per_source, fair_share), 0)
+
+
+def _select_source_candidates(items: list[Any], candidate_limit: int) -> list[Any]:
+    if candidate_limit <= 0:
+        return []
+    return sorted(
+        items,
+        key=lambda item: item.published_at
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )[:candidate_limit]
+
+
+def _max_datetime(
+    current: datetime | None,
+    candidate: datetime | None,
+) -> datetime | None:
+    if candidate is None:
+        return current
+    if current is None or candidate > current:
+        return candidate
+    return current
+
+
+def _safe_mark_source_check_started(db: Any, source_id: str) -> None:
+    marker = getattr(db, "mark_source_check_started", None)
+    if callable(marker):
+        marker(source_id)
+
+
+def _safe_mark_source_check_success(
+    db: Any,
+    source_id: str,
+    latest_feed_published_at: datetime | None,
+) -> None:
+    marker = getattr(db, "mark_source_check_success", None)
+    if callable(marker):
+        marker(source_id, latest_feed_published_at)
+
+
+def _safe_mark_source_check_failure(db: Any, source_id: str, error: str) -> None:
+    marker = getattr(db, "mark_source_check_failure", None)
+    if callable(marker):
+        marker(source_id, error)
+
+
+def _safe_update_source_latest_stored(
+    db: Any,
+    source_id: str,
+    latest_stored_published_at: datetime,
+) -> None:
+    updater = getattr(db, "update_source_latest_stored_published_at", None)
+    if callable(updater):
+        updater(source_id, latest_stored_published_at)
+
+
+def _load_latest_stored_published_at(
+    db: Any,
+    source_id: str,
+    fallback: datetime | None,
+) -> datetime | None:
+    loader = getattr(db, "get_latest_stored_published_at_by_source", None)
+    if callable(loader):
+        loaded = loader(source_id)
+        if loaded is not None:
+            return loaded
+    return fallback
+
+
+def _warn_if_fresh_source_looks_starved(
+    db: Any,
+    source: Any,
+    latest_feed_published_at: datetime | None,
+    source_items_inserted: int,
+    settings: Settings,
+) -> None:
+    if latest_feed_published_at is None or source_items_inserted > 0:
+        return
+    if latest_feed_published_at < (
+        datetime.now(timezone.utc) - timedelta(hours=settings.freshness_window_hours)
+    ):
+        return
+    latest_stored = getattr(source, "latest_stored_published_at", None)
+    if latest_stored is not None and latest_stored >= latest_feed_published_at:
+        return
+    db.log_event(
+        "warning",
+        "freshness",
+        "Source has fresh feed items but no new rows were inserted this run",
+        {
+            "source_id": source.id,
+            "source_name": source.name,
+            "latest_feed_published_at": latest_feed_published_at.isoformat(),
+            "latest_stored_published_at": latest_stored.isoformat()
+            if latest_stored
+            else None,
+        },
+    )
 
 
 def _send_discord_digest_if_any(*, db: Any, discord: Any, settings: Settings) -> None:

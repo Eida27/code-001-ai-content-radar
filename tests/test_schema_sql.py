@@ -9,6 +9,7 @@ ADVISOR_CLEANUP_MIGRATION = (
 RETENTION_DISCORD_MIGRATION = (
     ROOT / "supabase" / "migrations" / "003_retention_discord_digest.sql"
 )
+FRESHNESS_MIGRATION = ROOT / "supabase" / "migrations" / "004_freshness_hardening.sql"
 
 
 def test_schema_has_strict_statuses_indexes_dedupe_and_rls():
@@ -77,3 +78,24 @@ def test_retention_and_discord_digest_schema():
     assert "worker_runs_finished_at_idx" in sql
     assert "news_items_status_created_at_idx" in sql
     assert "alter table public.discord_alerts enable row level security" in sql
+
+
+def test_freshness_hardening_schema_and_sources():
+    sql = FRESHNESS_MIGRATION.read_text(encoding="utf-8").lower()
+
+    for column_name in [
+        "last_success_at",
+        "last_error_at",
+        "last_error_message",
+        "latest_feed_published_at",
+        "latest_stored_published_at",
+    ]:
+        assert column_name in sql
+
+    assert "sources_latest_feed_published_at_idx" in sql
+    assert "google ai blog" in sql
+    assert "nvidia ai blog" in sql
+    assert "tensorfeed ai" in sql
+    assert "https://blog.google/innovation-and-ai/technology/ai/rss/" in sql
+    assert "https://blogs.nvidia.com/blog/category/deep-learning/feed/" in sql
+    assert "https://tensorfeed.ai/feed.xml" in sql
