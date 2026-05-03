@@ -65,6 +65,40 @@ class SupabaseRestClient:
             for row in response.json()
         ]
 
+    def load_items_ready_for_drafting(
+        self, limit: int, min_importance_score: int
+    ) -> list[NewsItem]:
+        response = self._client.get(
+            "/news_items",
+            params={
+                "select": "*",
+                "status": "eq.scored",
+                "importance_score": f"gte.{min_importance_score}",
+                "order": "created_at.asc",
+                "limit": str(limit),
+            },
+        )
+        response.raise_for_status()
+
+        items: list[NewsItem] = []
+        for row in response.json():
+            if self._item_has_draft(row["id"]):
+                continue
+            items.append(_row_to_news_item(row))
+        return items
+
+    def _item_has_draft(self, news_item_id: str) -> bool:
+        response = self._client.get(
+            "/drafts",
+            params={
+                "select": "id",
+                "news_item_id": f"eq.{news_item_id}",
+                "limit": "1",
+            },
+        )
+        response.raise_for_status()
+        return bool(response.json())
+
     def count_drafts_created_today(self) -> int:
         today = datetime.now(timezone.utc).date().isoformat()
         response = self._client.get(
@@ -186,3 +220,26 @@ def _content_range_count(response: httpx.Response) -> int:
     if "/" not in content_range:
         return len(response.json())
     return int(content_range.rsplit("/", 1)[1])
+
+
+def _row_to_news_item(row: dict[str, Any]) -> NewsItem:
+    published_at = row.get("published_at")
+    if isinstance(published_at, str):
+        published_at = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+
+    return NewsItem(
+        id=row["id"],
+        source_id=row.get("source_id"),
+        title=row["title"],
+        url=row["url"],
+        canonical_url=row.get("canonical_url") or row["url"],
+        normalized_url_hash=row["normalized_url_hash"],
+        canonical_url_hash=row.get("canonical_url_hash"),
+        content_hash=row["content_hash"],
+        raw_summary=row.get("raw_summary"),
+        source_name=row.get("source_name"),
+        published_at=published_at,
+        status=row.get("status", "scored"),
+        importance_score=row.get("importance_score"),
+        importance_reason=row.get("importance_reason"),
+    )

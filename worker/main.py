@@ -11,6 +11,7 @@ if __package__ in {None, ""}:
 
 from worker.config import Settings, load_settings
 from worker.fetchers.rss_fetcher import RSSFetcher
+from worker.models import Score
 from worker.processing.draft_generator import DraftParseError, parse_ai_draft_response
 from worker.processing.dedupe import dedupe_in_memory
 from worker.processing.normalize import normalize_items
@@ -27,6 +28,7 @@ def run_worker(
     db: Any,
     fetchers: Mapping[str, Any],
     openrouter: Any,
+    fallback_openrouter: Any | None = None,
     discord: Any,
 ) -> None:
     run_id = db.start_worker_run()
@@ -37,6 +39,19 @@ def run_worker(
     processed_items = 0
 
     try:
+        ai_disabled_for_run, drafts_created_today, free_requests_today = (
+            _process_retryable_scored_items(
+                settings=settings,
+                db=db,
+                openrouter=openrouter,
+                fallback_openrouter=fallback_openrouter,
+                discord=discord,
+                ai_disabled_for_run=ai_disabled_for_run,
+                drafts_created_today=drafts_created_today,
+                free_requests_today=free_requests_today,
+            )
+        )
+
         sources = load_active_sources(db)
         for source in sources:
             if time.monotonic() >= deadline:
@@ -103,89 +118,22 @@ def run_worker(
                 if ai_disabled_for_run:
                     continue
 
-                try:
-                    raw_response = openrouter.generate_draft(saved_item, score)
-                    free_requests_today += 1
-                except OpenRouterRateLimitError as error:
-                    db.save_ai_request(
-                        news_item_id=saved_item.id,
-                        model_used=settings.openrouter_default_model,
-                        status="rate_limited",
-                        raw_response=str(error),
-                        parse_error=None,
-                    )
-                    db.update_item_status(saved_item.id, "draft_failed")
-                    saved_item.status = "draft_failed"
-                    ai_disabled_for_run = True
-                    db.log_event(
-                        "warning",
-                        "openrouter",
-                        "OpenRouter rate limit reached; disabling AI for this run",
-                        {"news_item_title": saved_item.title},
-                    )
-                    continue
-                except Exception as error:
-                    db.save_ai_request(
-                        news_item_id=saved_item.id,
-                        model_used=settings.openrouter_default_model,
-                        status="error",
-                        raw_response=str(error),
-                        parse_error=None,
-                    )
-                    db.update_item_status(saved_item.id, "draft_failed")
-                    saved_item.status = "draft_failed"
-                    db.log_event(
-                        "error",
-                        "openrouter",
-                        f"AI draft generation failed: {error}",
-                        {"news_item_title": saved_item.title},
-                    )
-                    continue
-
-                try:
-                    draft_package = parse_ai_draft_response(
-                        raw_response,
-                        model_used=settings.openrouter_default_model,
-                    )
-                except DraftParseError as error:
-                    db.save_ai_request(
-                        news_item_id=saved_item.id,
-                        model_used=settings.openrouter_default_model,
-                        status="parse_error",
-                        raw_response=error.raw_response,
-                        parse_error=error.parse_error,
-                    )
-                    db.update_item_status(saved_item.id, "draft_failed")
-                    saved_item.status = "draft_failed"
-                    db.log_event(
-                        "error",
-                        "openrouter",
-                        "AI response failed JSON validation",
-                        {"parse_error": error.parse_error},
-                    )
-                    continue
-
-                db.save_ai_request(
-                    news_item_id=saved_item.id,
+                draft_status = _draft_item(
+                    db=db,
+                    openrouter=openrouter,
+                    fallback_openrouter=fallback_openrouter,
+                    discord=discord,
+                    settings=settings,
+                    saved_item=saved_item,
+                    score=score,
                     model_used=settings.openrouter_default_model,
-                    status="success",
-                    raw_response=draft_package.raw_response,
-                    parse_error=None,
                 )
-                db.save_drafts(saved_item.id, draft_package.drafts)
-                drafts_created_today += 1
-                db.update_item_status(saved_item.id, "needs_review")
-                saved_item.status = "needs_review"
-
-                try:
-                    discord.send_alert(saved_item, draft_package.drafts, score)
-                except Exception as error:
-                    db.log_event(
-                        "error",
-                        "discord",
-                        f"Discord webhook failed: {error}",
-                        {"news_item_title": saved_item.title},
-                    )
+                if draft_status in {"success", "rate_limited", "error"}:
+                    free_requests_today += 1
+                if draft_status == "success":
+                    drafts_created_today += 1
+                elif draft_status == "rate_limited":
+                    ai_disabled_for_run = True
 
         db.finish_worker_run(
             run_id,
@@ -197,7 +145,7 @@ def run_worker(
         db.finish_worker_run(run_id, status="error", metadata={"error": str(error)})
         raise
     finally:
-        _close_resources(db, openrouter, discord, fetchers)
+        _close_resources(db, openrouter, fallback_openrouter, discord, fetchers)
 
 
 def main() -> None:
@@ -213,14 +161,190 @@ def main() -> None:
         settings.openrouter_default_model,
         settings.request_timeout_seconds,
     )
+    fallback_openrouter = None
+    if settings.allow_paid_fallback:
+        fallback_openrouter = OpenRouterClient(
+            settings.openrouter_api_key,
+            settings.openrouter_fallback_model,
+            settings.request_timeout_seconds,
+        )
     discord = DiscordNotifier(settings.discord_webhook_url, settings.request_timeout_seconds)
     run_worker(
         settings=settings,
         db=db,
         fetchers=fetchers,
         openrouter=openrouter,
+        fallback_openrouter=fallback_openrouter,
         discord=discord,
     )
+
+
+def _process_retryable_scored_items(
+    *,
+    settings: Settings,
+    db: Any,
+    openrouter: Any,
+    fallback_openrouter: Any | None,
+    discord: Any,
+    ai_disabled_for_run: bool,
+    drafts_created_today: int,
+    free_requests_today: int,
+) -> tuple[bool, int, int]:
+    retry_loader = getattr(db, "load_items_ready_for_drafting", None)
+    if not callable(retry_loader):
+        return ai_disabled_for_run, drafts_created_today, free_requests_today
+
+    retry_limit = max(settings.max_items_per_run, 0)
+    retryable_items = retry_loader(retry_limit, settings.min_importance_score)
+
+    for saved_item in retryable_items:
+        if drafts_created_today >= settings.max_ai_drafts_per_day:
+            break
+        if _free_model_budget_exhausted(settings, free_requests_today):
+            db.log_event(
+                "warning",
+                "openrouter",
+                "Daily free-model request limit reached",
+                {"model": settings.openrouter_default_model},
+            )
+            break
+        if ai_disabled_for_run:
+            break
+
+        score = Score(
+            value=saved_item.importance_score or settings.min_importance_score,
+            reason=saved_item.importance_reason or "Retrying previously scored item",
+        )
+        draft_status = _draft_item(
+            db=db,
+            openrouter=openrouter,
+            fallback_openrouter=fallback_openrouter,
+            discord=discord,
+            settings=settings,
+            saved_item=saved_item,
+            score=score,
+            model_used=settings.openrouter_default_model,
+        )
+        if draft_status in {"success", "rate_limited", "error"}:
+            free_requests_today += 1
+        if draft_status == "success":
+            drafts_created_today += 1
+        elif draft_status == "rate_limited":
+            ai_disabled_for_run = True
+
+    return ai_disabled_for_run, drafts_created_today, free_requests_today
+
+
+def _draft_item(
+    *,
+    db: Any,
+    openrouter: Any,
+    fallback_openrouter: Any | None,
+    discord: Any,
+    settings: Settings,
+    saved_item: Any,
+    score: Score,
+    model_used: str,
+) -> str:
+    try:
+        raw_response = openrouter.generate_draft(saved_item, score)
+    except OpenRouterRateLimitError as error:
+        db.save_ai_request(
+            news_item_id=saved_item.id,
+            model_used=model_used,
+            status="rate_limited",
+            raw_response=str(error),
+            parse_error=None,
+        )
+        if settings.allow_paid_fallback and fallback_openrouter is not None:
+            db.log_event(
+                "warning",
+                "openrouter",
+                "Default OpenRouter model rate-limited; trying fallback model",
+                {
+                    "news_item_title": saved_item.title,
+                    "fallback_model": settings.openrouter_fallback_model,
+                },
+            )
+            return _draft_item(
+                db=db,
+                openrouter=fallback_openrouter,
+                fallback_openrouter=None,
+                discord=discord,
+                settings=settings,
+                saved_item=saved_item,
+                score=score,
+                model_used=settings.openrouter_fallback_model,
+            )
+
+        saved_item.status = "scored"
+        db.log_event(
+            "warning",
+            "openrouter",
+            "OpenRouter rate limit reached; disabling AI for this run",
+            {"news_item_title": saved_item.title},
+        )
+        return "rate_limited"
+    except Exception as error:
+        db.save_ai_request(
+            news_item_id=saved_item.id,
+            model_used=model_used,
+            status="error",
+            raw_response=str(error),
+            parse_error=None,
+        )
+        db.update_item_status(saved_item.id, "draft_failed")
+        saved_item.status = "draft_failed"
+        db.log_event(
+            "error",
+            "openrouter",
+            f"AI draft generation failed: {error}",
+            {"news_item_title": saved_item.title},
+        )
+        return "error"
+
+    try:
+        draft_package = parse_ai_draft_response(raw_response, model_used=model_used)
+    except DraftParseError as error:
+        db.save_ai_request(
+            news_item_id=saved_item.id,
+            model_used=model_used,
+            status="parse_error",
+            raw_response=error.raw_response,
+            parse_error=error.parse_error,
+        )
+        db.update_item_status(saved_item.id, "draft_failed")
+        saved_item.status = "draft_failed"
+        db.log_event(
+            "error",
+            "openrouter",
+            "AI response failed JSON validation",
+            {"parse_error": error.parse_error},
+        )
+        return "parse_error"
+
+    db.save_ai_request(
+        news_item_id=saved_item.id,
+        model_used=model_used,
+        status="success",
+        raw_response=draft_package.raw_response,
+        parse_error=None,
+    )
+    db.save_drafts(saved_item.id, draft_package.drafts)
+    db.update_item_status(saved_item.id, "needs_review")
+    saved_item.status = "needs_review"
+
+    try:
+        discord.send_alert(saved_item, draft_package.drafts, score)
+    except Exception as error:
+        db.log_event(
+            "error",
+            "discord",
+            f"Discord webhook failed: {error}",
+            {"news_item_title": saved_item.title},
+        )
+
+    return "success"
 
 
 def _free_model_budget_exhausted(settings: Settings, free_requests_today: int) -> bool:

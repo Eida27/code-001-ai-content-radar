@@ -52,3 +52,9 @@ Run unit tests from the repository root:
 ```powershell
 .\.venv\Scripts\python -m pytest -q
 ```
+
+Run a live smoke check without generating AI drafts or sending Discord messages:
+
+```powershell
+.\.venv\Scripts\python -m worker.smoke
+```

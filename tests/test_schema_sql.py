@@ -3,6 +3,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "supabase" / "migrations" / "001_initial_schema.sql"
+ADVISOR_CLEANUP_MIGRATION = (
+    ROOT / "supabase" / "migrations" / "002_advisor_cleanup.sql"
+)
 
 
 def test_schema_has_strict_statuses_indexes_dedupe_and_rls():
@@ -46,3 +49,12 @@ def test_schema_stores_ai_raw_response_and_parse_errors():
     assert "raw_response text" in sql
     assert "parse_error text" in sql
     assert "rate_limited" in sql
+
+
+def test_advisor_cleanup_indexes_foreign_keys():
+    sql = ADVISOR_CLEANUP_MIGRATION.read_text(encoding="utf-8").lower()
+
+    assert "create index if not exists ai_requests_news_item_id_idx" in sql
+    assert "on public.ai_requests (news_item_id)" in sql
+    assert "create index if not exists posts_draft_id_idx" in sql
+    assert "on public.posts (draft_id)" in sql

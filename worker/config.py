@@ -13,6 +13,13 @@ def _int_env(name: str, default: int) -> int:
     return int(value)
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     supabase_url: str
@@ -20,6 +27,7 @@ class Settings:
     openrouter_api_key: str
     openrouter_default_model: str
     openrouter_fallback_model: str
+    allow_paid_fallback: bool
     discord_webhook_url: str
     min_importance_score: int
     max_ai_drafts_per_day: int
@@ -43,6 +51,7 @@ def load_settings() -> Settings:
         openrouter_fallback_model=os.getenv(
             "OPENROUTER_FALLBACK_MODEL", "google/gemma-4-31b-it"
         ),
+        allow_paid_fallback=_bool_env("ALLOW_PAID_FALLBACK", False),
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),
         min_importance_score=_int_env("MIN_IMPORTANCE_SCORE", 7),
         max_ai_drafts_per_day=_int_env("MAX_AI_DRAFTS_PER_DAY", 35),
