@@ -40,6 +40,8 @@ class Settings:
     source_timeout_seconds: int
     source_retry_limit: int
     run_timeout_seconds: int
+    run_lock_enabled: bool
+    run_lock_ttl_seconds: int
     request_timeout_seconds: int
     openrouter_daily_free_request_limit: int
     cleanup_enabled: bool
@@ -49,6 +51,10 @@ class Settings:
     retention_worker_run_days: int
     cleanup_batch_limit: int
     discord_max_items_per_digest: int
+    production_db_warning_mb: int
+    production_db_fail_mb: int
+    production_storage_warning_mb: int
+    production_storage_fail_mb: int
 
 
 def load_settings() -> Settings:
@@ -72,10 +78,12 @@ def load_settings() -> Settings:
         max_feed_candidates_per_source=_int_env("MAX_FEED_CANDIDATES_PER_SOURCE", 30),
         freshness_window_hours=_int_env("FRESHNESS_WINDOW_HOURS", 72),
         max_ai_calls_per_run=_int_env("MAX_AI_CALLS_PER_RUN", 4),
-        max_paid_fallbacks_per_run=_int_env("MAX_PAID_FALLBACKS_PER_RUN", 1),
+        max_paid_fallbacks_per_run=_int_env("MAX_PAID_FALLBACKS_PER_RUN", 0),
         source_timeout_seconds=_int_env("SOURCE_TIMEOUT_SECONDS", 20),
         source_retry_limit=_int_env("SOURCE_RETRY_LIMIT", 1),
         run_timeout_seconds=_int_env("RUN_TIMEOUT_SECONDS", 720),
+        run_lock_enabled=_bool_env("RUN_LOCK_ENABLED", True),
+        run_lock_ttl_seconds=_int_env("RUN_LOCK_TTL_SECONDS", 840),
         request_timeout_seconds=_int_env("REQUEST_TIMEOUT_SECONDS", 20),
         openrouter_daily_free_request_limit=_int_env(
             "OPENROUTER_DAILY_FREE_REQUEST_LIMIT", 50
@@ -87,4 +95,8 @@ def load_settings() -> Settings:
         retention_worker_run_days=_int_env("RETENTION_WORKER_RUN_DAYS", 90),
         cleanup_batch_limit=_int_env("CLEANUP_BATCH_LIMIT", 100),
         discord_max_items_per_digest=_int_env("DISCORD_MAX_ITEMS_PER_DIGEST", 10),
+        production_db_warning_mb=_int_env("PRODUCTION_DB_WARNING_MB", 350),
+        production_db_fail_mb=_int_env("PRODUCTION_DB_FAIL_MB", 450),
+        production_storage_warning_mb=_int_env("PRODUCTION_STORAGE_WARNING_MB", 750),
+        production_storage_fail_mb=_int_env("PRODUCTION_STORAGE_FAIL_MB", 950),
     )

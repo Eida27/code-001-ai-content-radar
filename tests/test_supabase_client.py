@@ -45,6 +45,16 @@ class FakeDraftRestClient:
         return FakeResponse([])
 
 
+class FakeRpcRestClient:
+    def __init__(self, payload=True):
+        self.payload = payload
+        self.calls = []
+
+    def post(self, path, json=None, headers=None):
+        self.calls.append((path, json, headers or {}))
+        return FakeResponse(self.payload)
+
+
 def test_load_items_ready_for_drafting_does_not_starve_after_drafted_rows():
     client = SupabaseRestClient("https://example.supabase.co", "service-role", 10)
     client._client.close()
@@ -82,6 +92,57 @@ def test_save_drafts_uses_unique_conflict_target_for_idempotency():
                 }
             ],
             {"Prefer": "resolution=ignore-duplicates,return=minimal"},
+        )
+    ]
+
+
+def test_worker_lock_rpc_methods_use_service_role_rpcs():
+    client = SupabaseRestClient("https://example.supabase.co", "service-role", 10)
+    client._client.close()
+    fake_rest = FakeRpcRestClient(True)
+    client._client = fake_rest
+
+    acquired = client.try_acquire_worker_lock("worker.main", "holder-1", 840)
+    released = client.release_worker_lock("worker.main", "holder-1")
+
+    assert acquired is True
+    assert released is True
+    assert fake_rest.calls == [
+        (
+            "/rpc/try_acquire_worker_lock",
+            {
+                "p_lock_name": "worker.main",
+                "p_holder": "holder-1",
+                "p_ttl_seconds": 840,
+            },
+            {"Prefer": "return=representation"},
+        ),
+        (
+            "/rpc/release_worker_lock",
+            {
+                "p_lock_name": "worker.main",
+                "p_holder": "holder-1",
+            },
+            {"Prefer": "return=representation"},
+        ),
+    ]
+
+
+def test_production_readiness_snapshot_uses_snapshot_rpc():
+    payload = {"db_size_bytes": 1024, "storage_bytes": 0}
+    client = SupabaseRestClient("https://example.supabase.co", "service-role", 10)
+    client._client.close()
+    fake_rest = FakeRpcRestClient(payload)
+    client._client = fake_rest
+
+    snapshot = client.get_production_readiness_snapshot()
+
+    assert snapshot == payload
+    assert fake_rest.calls == [
+        (
+            "/rpc/production_readiness_snapshot",
+            {},
+            {"Prefer": "return=representation"},
         )
     ]
 

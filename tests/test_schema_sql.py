@@ -13,6 +13,9 @@ FRESHNESS_MIGRATION = ROOT / "supabase" / "migrations" / "004_freshness_hardenin
 DRAFT_IDEMPOTENCY_MIGRATION = (
     ROOT / "supabase" / "migrations" / "005_draft_idempotency.sql"
 )
+PRODUCTION_READINESS_MIGRATION = (
+    ROOT / "supabase" / "migrations" / "006_production_readiness.sql"
+)
 
 
 def test_schema_has_strict_statuses_indexes_dedupe_and_rls():
@@ -110,3 +113,17 @@ def test_draft_idempotency_schema_has_unique_news_item_draft_type_index():
     assert "drafts_news_item_id_draft_type_unique_idx" in sql
     assert "create unique index if not exists" in sql
     assert "on public.drafts (news_item_id, draft_type)" in sql
+
+
+def test_production_readiness_schema_has_worker_lock_and_snapshot_rpc():
+    sql = PRODUCTION_READINESS_MIGRATION.read_text(encoding="utf-8").lower()
+
+    assert "create table if not exists public.worker_locks" in sql
+    assert "lock_name text primary key" in sql
+    assert "worker_locks_expires_at_idx" in sql
+    assert "alter table public.worker_locks enable row level security" in sql
+    assert "create or replace function public.try_acquire_worker_lock" in sql
+    assert "create or replace function public.release_worker_lock" in sql
+    assert "create or replace function public.production_readiness_snapshot" in sql
+    assert "revoke execute on function public.try_acquire_worker_lock" in sql
+    assert "grant execute on function public.try_acquire_worker_lock" in sql

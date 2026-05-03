@@ -56,10 +56,12 @@ def smoke_settings():
         max_feed_candidates_per_source=30,
         freshness_window_hours=72,
         max_ai_calls_per_run=4,
-        max_paid_fallbacks_per_run=1,
+        max_paid_fallbacks_per_run=0,
         source_timeout_seconds=1,
         source_retry_limit=1,
         run_timeout_seconds=60,
+        run_lock_enabled=False,
+        run_lock_ttl_seconds=840,
         request_timeout_seconds=1,
         openrouter_daily_free_request_limit=10,
         cleanup_enabled=True,
@@ -69,6 +71,10 @@ def smoke_settings():
         retention_worker_run_days=90,
         cleanup_batch_limit=100,
         discord_max_items_per_digest=10,
+        production_db_warning_mb=350,
+        production_db_fail_mb=450,
+        production_storage_warning_mb=750,
+        production_storage_fail_mb=950,
     )
 
 

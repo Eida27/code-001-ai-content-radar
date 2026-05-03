@@ -1,0 +1,8 @@
+[build]
+builder = "RAILPACK"
+watchPatterns = ["**"]
+
+[deploy]
+startCommand = "python main.py"
+cronSchedule = "*/15 * * * *"
+restartPolicyType = "NEVER"

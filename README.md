@@ -45,6 +45,35 @@ Recommended Railway start command when the service root is `worker`:
 python main.py
 ```
 
+The worker service root should be `worker` so Railway can read
+`worker/requirements.txt`, `worker/main.py`, and `worker/railway.toml`.
+That config uses Railpack, `python main.py`, `*/15 * * * *`, and restart
+policy `NEVER`. Do not add a Dockerfile unless Railpack detection fails or the
+worker later needs custom system packages.
+
+## Production Readiness
+
+Before enabling Railway cron, run this checklist from the repository root:
+
+```powershell
+.\.venv\Scripts\python -m pytest -q
+.\.venv\Scripts\python -m compileall worker
+.\.venv\Scripts\python -m worker.production_check
+.\.venv\Scripts\python -m worker.freshness_audit
+```
+
+Then confirm the Railway service root is `worker`, add the same secrets and
+settings from `.env` as Railway variables, and enable the cron schedule. The
+production check is read-only: it validates environment, Supabase schema/RLS,
+quota headroom, duplicate protection, OpenRouter key/model availability,
+Discord webhook validity, and RSS freshness without generating drafts or
+posting Discord messages.
+
+Production defaults are free-first: `ALLOW_PAID_FALLBACK=false`,
+`MAX_PAID_FALLBACKS_PER_RUN=0`, and `MAX_AI_CALLS_PER_RUN=4`. If you
+intentionally enable paid fallback, keep a low per-run cap and treat the
+production check warning as a cost reminder.
+
 ## Verification
 
 Run unit tests from the repository root:

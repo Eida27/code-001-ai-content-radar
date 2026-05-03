@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,9 @@ from worker.services.supabase_client import DuplicateItemError, SupabaseRestClie
 from worker.sources import load_active_sources
 
 
+RUN_LOCK_NAME = "worker.main"
+
+
 @dataclass(slots=True)
 class DraftAttempt:
     status: str
@@ -46,17 +50,43 @@ def run_worker(
     fallback_openrouter: Any | None = None,
     discord: Any,
 ) -> None:
-    run_id = db.start_worker_run()
-    deadline = time.monotonic() + settings.run_timeout_seconds
-    drafts_created_today = db.count_drafts_created_today()
-    free_requests_today = db.count_ai_requests_today(settings.openrouter_default_model)
-    ai_calls_this_run = 0
-    paid_fallbacks_this_run = 0
-    ai_disabled_for_run = False
-    items_inserted = 0
-    candidates_considered = 0
+    lock_holder = f"{RUN_LOCK_NAME}:{uuid.uuid4()}"
+    lock_acquired = False
+    run_id: str | None = None
 
     try:
+        if settings.run_lock_enabled:
+            lock_acquired = _try_acquire_run_lock(db, lock_holder, settings)
+            if not lock_acquired:
+                db.log_event(
+                    "warning",
+                    "worker",
+                    "Worker lock is already held; skipping this run",
+                    {
+                        "lock_name": RUN_LOCK_NAME,
+                        "run_lock_ttl_seconds": settings.run_lock_ttl_seconds,
+                    },
+                )
+                _close_resources(db, openrouter, fallback_openrouter, discord, fetchers)
+                return
+
+        run_id = db.start_worker_run()
+    except BaseException:
+        if lock_acquired:
+            _safe_release_run_lock(db, lock_holder)
+        _close_resources(db, openrouter, fallback_openrouter, discord, fetchers)
+        raise
+
+    deadline = time.monotonic() + settings.run_timeout_seconds
+    try:
+        drafts_created_today = db.count_drafts_created_today()
+        free_requests_today = db.count_ai_requests_today(settings.openrouter_default_model)
+        ai_calls_this_run = 0
+        paid_fallbacks_this_run = 0
+        ai_disabled_for_run = False
+        items_inserted = 0
+        candidates_considered = 0
+
         (
             ai_disabled_for_run,
             drafts_created_today,
@@ -263,13 +293,16 @@ def run_worker(
         )
     except BaseException as error:
         db.log_event("error", "worker", f"Worker run failed: {error}")
-        db.finish_worker_run(
-            run_id,
-            status="error",
-            metadata={"error": str(error), "error_type": type(error).__name__},
-        )
+        if run_id is not None:
+            db.finish_worker_run(
+                run_id,
+                status="error",
+                metadata={"error": str(error), "error_type": type(error).__name__},
+            )
         raise
     finally:
+        if lock_acquired:
+            _safe_release_run_lock(db, lock_holder)
         _close_resources(db, openrouter, fallback_openrouter, discord, fetchers)
 
 
@@ -766,6 +799,33 @@ def _run_retention_cleanup_if_enabled(
             "cleanup",
             "Retention cleanup completed",
             result.to_metadata(),
+        )
+
+
+def _try_acquire_run_lock(db: Any, holder: str, settings: Settings) -> bool:
+    locker = getattr(db, "try_acquire_worker_lock", None)
+    if not callable(locker):
+        db.log_event(
+            "warning",
+            "worker",
+            "Run lock is enabled but the database client does not support it",
+        )
+        return True
+    return bool(locker(RUN_LOCK_NAME, holder, settings.run_lock_ttl_seconds))
+
+
+def _safe_release_run_lock(db: Any, holder: str) -> None:
+    releaser = getattr(db, "release_worker_lock", None)
+    if not callable(releaser):
+        return
+    try:
+        releaser(RUN_LOCK_NAME, holder)
+    except Exception as error:
+        db.log_event(
+            "error",
+            "worker",
+            f"Worker lock release failed: {error}",
+            {"lock_name": RUN_LOCK_NAME},
         )
 
 

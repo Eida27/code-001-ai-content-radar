@@ -30,6 +30,8 @@ class FakeSettings:
     retention_worker_run_days = 90
     cleanup_batch_limit = 100
     discord_max_items_per_digest = 10
+    run_lock_enabled = False
+    run_lock_ttl_seconds = 840
 
 
 class FakeDB:
@@ -47,9 +49,11 @@ class FakeDB:
         self.retry_discord_alerts = []
         self.failed_discord_alerts = []
         self.finished = []
+        self.started_runs = []
         self.closed = False
 
     def start_worker_run(self):
+        self.started_runs.append("run-1")
         return "run-1"
 
     def finish_worker_run(self, run_id, status, metadata=None):
@@ -704,3 +708,83 @@ def test_source_health_success_and_failure_are_recorded():
     assert db.source_checks == ["source-a", "source-b"]
     assert db.source_successes == [("source-a", fresh)]
     assert db.source_failures == [("source-b", "timeout")]
+
+
+def test_worker_skips_run_when_database_lock_is_held():
+    class LockedDB(FakeDB):
+        def try_acquire_worker_lock(self, lock_name, holder, ttl_seconds):
+            self.lock_attempt = (lock_name, holder, ttl_seconds)
+            return False
+
+        def start_worker_run(self):
+            raise AssertionError("worker run should not start when lock is held")
+
+    settings = FakeSettings()
+    settings.run_lock_enabled = True
+    source = official_source()
+    db = LockedDB([source])
+    fetcher = FakeFetcher(items=[major_item()])
+    openrouter = FakeOpenRouter([VALID_AI_JSON])
+    discord = FakeDiscord()
+
+    run_worker(
+        settings=settings,
+        db=db,
+        fetchers={"rss": fetcher},
+        openrouter=openrouter,
+        discord=discord,
+    )
+
+    assert db.lock_attempt[0] == "worker.main"
+    assert db.finished == []
+    assert fetcher.closed is True
+    assert openrouter.closed is True
+    assert discord.closed is True
+    assert any("Worker lock is already held" in log[2] for log in db.logs)
+
+
+def test_worker_releases_database_lock_after_success_and_error():
+    class LockingDB(FakeDB):
+        def __init__(self, sources):
+            super().__init__(sources)
+            self.acquired = []
+            self.released = []
+
+        def try_acquire_worker_lock(self, lock_name, holder, ttl_seconds):
+            self.acquired.append((lock_name, holder, ttl_seconds))
+            return True
+
+        def release_worker_lock(self, lock_name, holder):
+            self.released.append((lock_name, holder))
+            return True
+
+    settings = FakeSettings()
+    settings.run_lock_enabled = True
+
+    success_db = LockingDB([])
+    run_worker(
+        settings=settings,
+        db=success_db,
+        fetchers={"rss": FakeFetcher(items=[])},
+        openrouter=FakeOpenRouter([]),
+        discord=FakeDiscord(),
+    )
+
+    error_db = LockingDB([official_source()])
+    try:
+        run_worker(
+            settings=settings,
+            db=error_db,
+            fetchers={"rss": FakeFetcher(items=[major_item()])},
+            openrouter=FakeOpenRouter([KeyboardInterrupt()]),
+            discord=FakeDiscord(),
+        )
+    except KeyboardInterrupt:
+        pass
+
+    assert success_db.released == [
+        ("worker.main", success_db.acquired[0][1]),
+    ]
+    assert error_db.released == [
+        ("worker.main", error_db.acquired[0][1]),
+    ]

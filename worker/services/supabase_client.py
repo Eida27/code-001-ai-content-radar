@@ -31,6 +31,50 @@ class SupabaseRestClient:
         response.raise_for_status()
         return response.json()[0]["id"]
 
+    def try_acquire_worker_lock(
+        self,
+        lock_name: str,
+        holder: str,
+        ttl_seconds: int,
+    ) -> bool:
+        response = self._client.post(
+            "/rpc/try_acquire_worker_lock",
+            json={
+                "p_lock_name": lock_name,
+                "p_holder": holder,
+                "p_ttl_seconds": ttl_seconds,
+            },
+            headers={"Prefer": "return=representation"},
+        )
+        response.raise_for_status()
+        return _rpc_bool(response.json())
+
+    def release_worker_lock(self, lock_name: str, holder: str) -> bool:
+        response = self._client.post(
+            "/rpc/release_worker_lock",
+            json={
+                "p_lock_name": lock_name,
+                "p_holder": holder,
+            },
+            headers={"Prefer": "return=representation"},
+        )
+        response.raise_for_status()
+        return _rpc_bool(response.json())
+
+    def get_production_readiness_snapshot(self) -> dict[str, Any]:
+        response = self._client.post(
+            "/rpc/production_readiness_snapshot",
+            json={},
+            headers={"Prefer": "return=representation"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            return payload
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+        raise ValueError("Unexpected production readiness snapshot response")
+
     def finish_worker_run(
         self, run_id: str, status: str, metadata: dict[str, Any] | None = None
     ) -> None:
@@ -571,6 +615,18 @@ def _content_range_count(response: httpx.Response) -> int:
     if "/" not in content_range:
         return len(response.json())
     return int(content_range.rsplit("/", 1)[1])
+
+
+def _rpc_bool(payload: Any) -> bool:
+    if isinstance(payload, bool):
+        return payload
+    if isinstance(payload, list) and payload and isinstance(payload[0], bool):
+        return payload[0]
+    if isinstance(payload, dict):
+        for value in payload.values():
+            if isinstance(value, bool):
+                return value
+    return bool(payload)
 
 
 def _parse_datetime(value: Any) -> datetime | None:
