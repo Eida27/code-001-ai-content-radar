@@ -53,3 +53,14 @@ def test_production_env_defaults_and_railway_config_are_documented():
     assert 'startCommand = "python main.py"' in railway
     assert 'cronSchedule = "*/15 * * * *"' in railway
     assert 'restartPolicyType = "NEVER"' in railway
+
+
+def test_reliable_unofficial_rss_allowlist_is_documented():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "Reliable Unofficial RSS Sources" in readme
+    assert "verified_creator" in readme
+    assert "reliable_forum" in readme
+    assert "ai_aggregator" in readme
+    assert "supabase/queries/source_allowlist_examples.sql" in readme
+    assert "Do not auto-discover sources" in readme

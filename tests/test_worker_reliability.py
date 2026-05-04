@@ -244,6 +244,17 @@ def official_source(source_id="source-1"):
     )
 
 
+def verified_creator_source(source_id="creator-1"):
+    return Source(
+        id=source_id,
+        name="Trusted Creator Feed",
+        type="rss",
+        url="https://creator.example/feed.xml",
+        category="verified_creator",
+        priority=7,
+    )
+
+
 def major_item(url="https://openai.com/news/model"):
     return RawItem(
         title="OpenAI launches new model API for developers",
@@ -397,6 +408,36 @@ def test_worker_retries_existing_scored_items_after_rate_limit_recovers():
 
     assert openrouter.calls == 1
     assert db.drafts
+    assert len(discord.digests) == 1
+
+
+def test_unofficial_high_signal_item_reaches_review_with_unconfirmed_reason():
+    source = verified_creator_source()
+    db = FakeDB([source])
+    fetcher = FakeFetcher(
+        items=[
+            RawItem(
+                title="Leak: OpenAI new model API for developers",
+                url="https://creator.example/openai-model-api",
+                raw_summary="A verified creator says an OpenAI developer API update is coming.",
+                published_at=datetime(2026, 5, 3, tzinfo=timezone.utc),
+            )
+        ]
+    )
+    openrouter = FakeOpenRouter([VALID_AI_JSON])
+    discord = FakeDiscord()
+
+    run_worker(
+        settings=FakeSettings(),
+        db=db,
+        fetchers={"rss": fetcher},
+        openrouter=openrouter,
+        discord=discord,
+    )
+
+    assert db.items[0].status == "needs_review"
+    assert len(db.discord_alerts) == 1
+    assert "Unconfirmed: verify before posting" in db.discord_alerts[0][2].reason
     assert len(discord.digests) == 1
 
 

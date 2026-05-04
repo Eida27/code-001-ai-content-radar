@@ -4,6 +4,8 @@ import httpx
 
 from worker.models import NewsItem, Score
 
+UNCONFIRMED_REASON = "Unconfirmed: verify before posting"
+
 
 class OpenRouterRateLimitError(RuntimeError):
     pass
@@ -23,6 +25,7 @@ class OpenRouterClient:
         )
 
     def generate_draft(self, item: NewsItem, score: Score) -> str:
+        unconfirmed_instruction = _unconfirmed_instruction(score)
         response = self._client.post(
             "/chat/completions",
             json={
@@ -34,6 +37,7 @@ class OpenRouterClient:
                         "content": (
                             "Write factual X draft options as JSON only. "
                             "Do not invent details beyond the source."
+                            f"{unconfirmed_instruction}"
                         ),
                     },
                     {
@@ -43,6 +47,7 @@ class OpenRouterClient:
                             f"Summary: {item.raw_summary or ''}\n"
                             f"URL: {item.canonical_url}\n"
                             f"Importance: {score.reason}\n\n"
+                            f"{_source_confidence_note(score)}"
                             "Return keys: short_post, long_post, thread, "
                             "why_it_matters, risk_note."
                         ),
@@ -58,3 +63,23 @@ class OpenRouterClient:
 
     def close(self) -> None:
         self._client.close()
+
+
+def _is_unconfirmed(score: Score) -> bool:
+    return UNCONFIRMED_REASON.lower() in score.reason.lower()
+
+
+def _unconfirmed_instruction(score: Score) -> str:
+    if not _is_unconfirmed(score):
+        return ""
+    return (
+        " This item is unconfirmed. Say that clearly, avoid definitive claims, "
+        "and require manual verification. Do not describe it as launched, "
+        "released, or announced unless an official source confirms it."
+    )
+
+
+def _source_confidence_note(score: Score) -> str:
+    if not _is_unconfirmed(score):
+        return ""
+    return "Source confidence: unconfirmed. Requires manual confirmation before posting.\n"
