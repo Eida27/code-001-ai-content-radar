@@ -16,6 +16,9 @@ DRAFT_IDEMPOTENCY_MIGRATION = (
 PRODUCTION_READINESS_MIGRATION = (
     ROOT / "supabase" / "migrations" / "006_production_readiness.sql"
 )
+IMAGE_OVERLAY_CAPTION_MIGRATION = (
+    ROOT / "supabase" / "migrations" / "007_image_overlay_caption_draft_type.sql"
+)
 
 
 def test_schema_has_strict_statuses_indexes_dedupe_and_rls():
@@ -127,3 +130,10 @@ def test_production_readiness_schema_has_worker_lock_and_snapshot_rpc():
     assert "create or replace function public.production_readiness_snapshot" in sql
     assert "revoke execute on function public.try_acquire_worker_lock" in sql
     assert "grant execute on function public.try_acquire_worker_lock" in sql
+
+
+def test_image_overlay_caption_migration_adds_draft_type_enum_value():
+    sql = IMAGE_OVERLAY_CAPTION_MIGRATION.read_text(encoding="utf-8").lower()
+
+    assert "alter type public.draft_type" in sql
+    assert "add value if not exists 'image_overlay_caption'" in sql

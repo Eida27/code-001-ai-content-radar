@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from worker.models import Draft, DraftPackage
 
@@ -17,11 +18,16 @@ class DraftParseError(ValueError):
 class AIDraftResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
+    image_overlay_caption: str = Field(min_length=1, max_length=180)
     short_post: str = Field(min_length=1, max_length=280)
-    long_post: str = Field(min_length=1, max_length=800)
-    thread: list[str] = Field(min_length=1, max_length=5)
-    why_it_matters: str = Field(min_length=1, max_length=280)
-    risk_note: str = Field(min_length=1, max_length=280)
+
+    @field_validator("image_overlay_caption")
+    @classmethod
+    def validate_overlay_sentence_count(cls, value: str) -> str:
+        sentence_count = _count_sentences(value)
+        if sentence_count > 2:
+            raise ValueError("image_overlay_caption must be 1-2 sentences")
+        return value
 
 
 def parse_ai_draft_response(raw_response: str, model_used: str) -> DraftPackage:
@@ -44,10 +50,12 @@ def parse_ai_draft_response(raw_response: str, model_used: str) -> DraftPackage:
         ) from error
 
     drafts = [
+        Draft("image_overlay_caption", response.image_overlay_caption, model_used),
         Draft("short_post", response.short_post, model_used),
-        Draft("long_post", response.long_post, model_used),
-        Draft("thread", "\n\n".join(response.thread), model_used),
-        Draft("why_it_matters", response.why_it_matters, model_used),
-        Draft("risk_note", response.risk_note, model_used),
     ]
     return DraftPackage(drafts=drafts, raw_response=raw_response)
+
+
+def _count_sentences(value: str) -> int:
+    sentences = re.findall(r"[^.!?]+(?:[.!?]+|$)", value.strip())
+    return len([sentence for sentence in sentences if sentence.strip()])
