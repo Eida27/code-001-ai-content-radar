@@ -275,11 +275,8 @@ def dated_item(url, published_at, title="OpenAI launches new model API for devel
 
 VALID_AI_JSON = """
 {
-  "short_post": "OpenAI released a model API update.",
-  "long_post": "OpenAI released a model API update for developers.",
-  "thread": ["OpenAI released an update.", "Developers should verify the source."],
-  "why_it_matters": "Developers may get a faster workflow.",
-  "risk_note": "Verify details before posting."
+  "image_overlay_caption": "OpenAI released a model API update for builders. Verify the details before posting.",
+  "short_post": "OpenAI released a model API update for builders. Review the source before using it."
 }
 """
 
@@ -500,7 +497,7 @@ def test_paid_fallbacks_stop_at_per_run_cap():
 
     assert openrouter.calls == 2
     assert fallback_openrouter.calls == 1
-    assert len(db.drafts) == 5
+    assert len(db.drafts) == 2
     assert any("Paid fallback limit reached" in log[2] for log in db.logs)
 
 
@@ -537,7 +534,7 @@ def test_total_ai_calls_stop_at_per_run_cap_even_with_fallback():
 
     assert openrouter.calls == 1
     assert fallback_openrouter.calls == 1
-    assert len(db.drafts) == 5
+    assert len(db.drafts) == 2
     assert any("Per-run AI call limit reached" in log[2] for log in db.logs)
 
 

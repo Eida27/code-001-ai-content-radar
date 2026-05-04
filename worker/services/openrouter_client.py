@@ -35,8 +35,15 @@ class OpenRouterClient:
                     {
                         "role": "system",
                         "content": (
-                            "Write factual X draft options as JSON only. "
-                            "Do not invent details beyond the source."
+                            "Write factual AI news draft copy as JSON only for "
+                            "AI builders. Do not invent details beyond the source. "
+                            "Return exactly these JSON keys: "
+                            "image_overlay_caption, short_post. "
+                            "The image_overlay_caption must be 1-2 sentences and "
+                            "180 characters or fewer for a black gradient image overlay. "
+                            "The short_post must be a single X/Twitter-ready post, "
+                            "280 characters or fewer. Do not include the source URL "
+                            "in short_post; reviewers will attach links separately."
                             f"{unconfirmed_instruction}"
                         ),
                     },
@@ -48,8 +55,8 @@ class OpenRouterClient:
                             f"URL: {item.canonical_url}\n"
                             f"Importance: {score.reason}\n\n"
                             f"{_source_confidence_note(score)}"
-                            "Return keys: short_post, long_post, thread, "
-                            "why_it_matters, risk_note."
+                            "Return exactly these JSON keys: "
+                            "image_overlay_caption, short_post."
                         ),
                     },
                 ],
