@@ -121,3 +121,27 @@ MAX_ITEMS_PER_SOURCE=10
 MAX_FEED_CANDIDATES_PER_SOURCE=30
 FRESHNESS_WINDOW_HOURS=72
 ```
+
+## Reliable Unofficial RSS Sources
+
+The worker can monitor manually allowlisted RSS or Atom feeds from reliable
+unofficial sources, such as verified creators, forums with a strong moderation
+record, and AI news aggregators. Do not auto-discover sources. Add only feeds
+you have reviewed and are comfortable seeing in the manual review queue.
+
+Use these source categories and priority ranges:
+
+```text
+verified_creator  priority 5-7
+reliable_forum    priority 5-6
+ai_aggregator     priority 5
+```
+
+Official and high-trust sources keep their existing higher priorities. Unofficial
+sources can create review items when their content has strong AI, company, and
+audience-impact signals, but draft prompts and Discord review reasons label
+them as unconfirmed and require manual verification before posting.
+
+Use `supabase/queries/source_allowlist_examples.sql` as a safe template for
+adding approved RSS-compatible sources. It inserts nothing until each candidate
+row is reviewed and marked `approved = true`.
