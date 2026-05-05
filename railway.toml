@@ -3,6 +3,6 @@ builder = "RAILPACK"
 watchPatterns = ["**"]
 
 [deploy]
-startCommand = "python main.py"
+startCommand = "python -m worker.main"
 cronSchedule = "*/15 * * * *"
 restartPolicyType = "NEVER"
