@@ -18,14 +18,21 @@ def test_python_venv_setup_is_documented_and_ignored():
 
 def test_requirements_are_pinned():
     requirements = (ROOT / "worker" / "requirements.txt").read_text(encoding="utf-8")
+    root_requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     dependency_lines = [
         line.strip()
         for line in requirements.splitlines()
         if line.strip() and not line.startswith("#")
     ]
+    root_dependency_lines = [
+        line.strip()
+        for line in root_requirements.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
 
     assert dependency_lines
     assert all("==" in line for line in dependency_lines)
+    assert root_dependency_lines == dependency_lines
 
 
 def test_railway_cron_operational_limits_are_documented():
@@ -40,7 +47,7 @@ def test_railway_cron_operational_limits_are_documented():
 def test_production_env_defaults_and_railway_config_are_documented():
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    railway = (ROOT / "worker" / "railway.toml").read_text(encoding="utf-8")
+    railway = (ROOT / "railway.toml").read_text(encoding="utf-8")
 
     assert "ALLOW_PAID_FALLBACK=false" in env_example
     assert "MAX_PAID_FALLBACKS_PER_RUN=0" in env_example
@@ -49,20 +56,20 @@ def test_production_env_defaults_and_railway_config_are_documented():
     assert "PRODUCTION_DB_WARNING_MB=350" in env_example
     assert "PRODUCTION_STORAGE_FAIL_MB=950" in env_example
     assert "python -m worker.production_check" in readme
+    assert "repository root" in readme
     assert 'builder = "RAILPACK"' in railway
-    assert 'startCommand = "python main.py"' in railway
+    assert 'startCommand = "python -m worker.main"' in railway
     assert 'cronSchedule = "*/15 * * * *"' in railway
     assert 'restartPolicyType = "NEVER"' in railway
+    assert not (ROOT / "worker" / "railway.toml").exists()
 
 
 def test_railway_python_runtime_is_pinned_and_documented():
-    python_version = (ROOT / "worker" / ".python-version").read_text(
-        encoding="utf-8"
-    )
+    python_version = (ROOT / ".python-version").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert python_version.strip() == "3.13.2"
-    assert "worker/.python-version" in readme
+    assert ".python-version" in readme
     assert "Python 3.13.2" in readme
 
 

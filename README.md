@@ -28,7 +28,7 @@ python main.py
 ```
 
 The `.venv/` directory is intentionally ignored by git. Railway/Railpack uses
-`worker/.python-version` to pin the cloud runtime to Python 3.13.2.
+`.python-version` to pin the cloud runtime to Python 3.13.2.
 
 ## Railway Cron Notes
 
@@ -40,18 +40,19 @@ Railway cron schedules are evaluated in UTC. The minimum frequency is 5 minutes,
 
 The worker is designed to finish before the next schedule and close HTTP resources. If a previous Railway cron execution is still active, Railway can skip the next scheduled run, so the worker must remain idempotent and time-bounded.
 
-Recommended Railway start command when the service root is `worker`:
+Recommended Railway start command when the service root is the repository root:
 
 ```bash
-python main.py
+python -m worker.main
 ```
 
-The worker service root should be `worker` so Railway can read
-`worker/.python-version`, `worker/requirements.txt`, `worker/main.py`, and
-`worker/railway.toml`. That config uses Railpack, Python 3.13.2,
-`python main.py`, `*/15 * * * *`, and restart policy `NEVER`. Do not add a
-Dockerfile unless Railpack detection fails or the worker later needs custom
-system packages.
+The Railway service root should be the repository root so Railway can read
+`.python-version`, `requirements.txt`, `railway.toml`, and the `worker` package.
+That config uses Railpack, Python 3.13.2, `python -m worker.main`,
+`*/15 * * * *`, and restart policy `NEVER`. Do not deploy the `worker`
+directory as a flattened app root because `main.py` imports the `worker`
+package. Do not add a Dockerfile unless Railpack detection fails or the worker
+later needs custom system packages.
 
 ## Production Readiness
 
@@ -65,12 +66,12 @@ Before enabling Railway cron, run this checklist from the repository root:
 .\.venv\Scripts\python -m worker.freshness_audit
 ```
 
-Then confirm the Railway service root is `worker`, add the same secrets and
-settings from `.env` as Railway variables, and enable the cron schedule. The
-production check is read-only: it validates environment, Supabase schema/RLS,
-quota headroom, duplicate protection, OpenRouter key/model availability,
-Discord webhook validity, and RSS freshness without generating drafts or
-posting Discord messages.
+Then confirm the Railway service root is the repository root, add the same
+secrets and settings from `.env` as Railway variables, and enable the cron
+schedule. The production check is read-only: it validates environment, Supabase
+schema/RLS, quota headroom, duplicate protection, OpenRouter key/model
+availability, Discord webhook validity, and RSS freshness without generating
+drafts or posting Discord messages.
 
 Production defaults are free-first: `ALLOW_PAID_FALLBACK=false`,
 `MAX_PAID_FALLBACKS_PER_RUN=0`, and `MAX_AI_CALLS_PER_RUN=4`. If you
