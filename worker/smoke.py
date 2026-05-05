@@ -76,6 +76,7 @@ def run_worker_no_ai_smoke(
         settings,
         max_items_per_run=3,
         max_ai_drafts_per_day=0,
+        discord_max_items_per_digest=0,
     )
     try:
         run_worker(

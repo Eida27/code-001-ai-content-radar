@@ -1,5 +1,5 @@
 from worker.config import Settings
-from worker.models import Source
+from worker.models import Score, Source
 from worker.processing.normalize import normalize_items
 from worker.smoke import (
     check_discord_webhook,
@@ -121,3 +121,25 @@ def test_smoke_can_run_worker_with_ai_disabled():
     assert result.ok is True
     assert openrouter.calls == 0
     assert not db.drafts
+
+
+def test_smoke_disables_discord_digest_delivery():
+    source = official_source()
+    item = normalize_items([major_item()], source)[0]
+    item.id = "news-item-1"
+    item.importance_score = 8
+    db = FakeDB([])
+    db.discord_alerts = [(item, [], Score(8, "Queued before smoke"))]
+    discord = FakeDiscord()
+
+    result = run_worker_no_ai_smoke(
+        settings=smoke_settings(),
+        db=db,
+        fetchers={"rss": FakeFetcher(items=[])},
+        openrouter=FakeOpenRouter([]),
+        discord=discord,
+    )
+
+    assert result.ok is True
+    assert discord.digests == []
+    assert db.sent_discord_alert_ids == []
