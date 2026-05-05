@@ -27,7 +27,8 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-The `.venv/` directory is intentionally ignored by git.
+The `.venv/` directory is intentionally ignored by git. Railway/Railpack uses
+`worker/.python-version` to pin the cloud runtime to Python 3.13.2.
 
 ## Railway Cron Notes
 
@@ -46,10 +47,11 @@ python main.py
 ```
 
 The worker service root should be `worker` so Railway can read
-`worker/requirements.txt`, `worker/main.py`, and `worker/railway.toml`.
-That config uses Railpack, `python main.py`, `*/15 * * * *`, and restart
-policy `NEVER`. Do not add a Dockerfile unless Railpack detection fails or the
-worker later needs custom system packages.
+`worker/.python-version`, `worker/requirements.txt`, `worker/main.py`, and
+`worker/railway.toml`. That config uses Railpack, Python 3.13.2,
+`python main.py`, `*/15 * * * *`, and restart policy `NEVER`. Do not add a
+Dockerfile unless Railpack detection fails or the worker later needs custom
+system packages.
 
 ## Production Readiness
 
@@ -58,6 +60,7 @@ Before enabling Railway cron, run this checklist from the repository root:
 ```powershell
 .\.venv\Scripts\python -m pytest -q
 .\.venv\Scripts\python -m compileall worker
+.\.venv\Scripts\python -m pip check
 .\.venv\Scripts\python -m worker.production_check
 .\.venv\Scripts\python -m worker.freshness_audit
 ```
@@ -87,6 +90,10 @@ Run a live smoke check without generating AI drafts or sending Discord messages:
 ```powershell
 .\.venv\Scripts\python -m worker.smoke
 ```
+
+This smoke check is intentionally live: it can write worker/source/news state to
+Supabase so the runtime path is exercised. Use `worker.production_check` when
+you need a read-only deployment check.
 
 Run a freshness audit without generating AI drafts or sending Discord messages:
 

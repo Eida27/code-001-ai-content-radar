@@ -55,6 +55,17 @@ def test_production_env_defaults_and_railway_config_are_documented():
     assert 'restartPolicyType = "NEVER"' in railway
 
 
+def test_railway_python_runtime_is_pinned_and_documented():
+    python_version = (ROOT / "worker" / ".python-version").read_text(
+        encoding="utf-8"
+    )
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert python_version.strip() == "3.13.2"
+    assert "worker/.python-version" in readme
+    assert "Python 3.13.2" in readme
+
+
 def test_reliable_unofficial_rss_allowlist_is_documented():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
